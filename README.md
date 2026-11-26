@@ -10,8 +10,7 @@ pathfinding or aim maths in the submitted agent.
 
 Pure reinforcement learning rarely discovers keycard → locked door → exit in a few hours. We first train
 the network to imitate a **training-only scripted teacher** with DAgger (the network plays, the teacher
-labels every state it visits, so the network learns to recover from its own mistakes), and we built our
-own recurrent PPO for fine-tuning. The agent keeps its own **SLAM-style map** of the level, built only
+labels every state it visits, so the network learns to recover from its own mistakes). The agent keeps its own **SLAM-style map** of the level, built only
 from its observations and its own actions, and reads it through a **learned planner module**.
 
 ## Repository layout
@@ -26,7 +25,6 @@ submission/weights/      trained weights (Git LFS)
 training/mapgen.py       procedural maps in the organisers' ASCII-grid UDMF format, all four tiers
 training/teacher.py      scripted teacher (TRAINING ONLY): frontier exploration, keys, doors, combat
 training/dagger.py       imitation learning (DAgger)
-training/ppo.py          our recurrent PPO (rewards mirror the scoring categories)
 training/scorer.py       local estimate of the official scoring, from privileged state
 training/evaluate.py     score a policy on a held-out map set
 training/compare.py      score any checkout's agent on the same maps and seeds
@@ -67,7 +65,6 @@ uv run python validate.py                          # official validator
 uv run python training/make_maps.py                # training maps + held-out maps
 uv run python training/evaluate.py --policy teacher                # score the teacher
 uv run python training/dagger.py --rounds 8 --device mps           # imitation (use --device cpu or cuda elsewhere)
-uv run python training/ppo.py --init runs/dagger/best.pt           # PPO fine-tune
 uv run python training/publish.py runs/dagger/best.pt              # copy weights into submission/
 uv run python training/watch.py                                    # watch the submitted agent
 uv run python training/watch.py --live                             # follow the newest training checkpoint
@@ -77,6 +74,6 @@ uv run python training/watch.py --live                             # follow the 
 
 - Decisions come from trained neural parameters only. The teacher (which uses path search and aim
   maths with privileged engine state) lives in `training/` and is never imported by `submission/`.
-- No Stable-Baselines3 or other off-the-shelf RL code: the network, DAgger and PPO are our own.
+- No Stable-Baselines3 or other off-the-shelf code: the network and the DAgger pipeline are our own.
 - The agent uses only the official observation dictionary; no engine, network or disk access.
 - Training maps are generated; nothing is memorised from evaluation.
