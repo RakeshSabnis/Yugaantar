@@ -153,7 +153,8 @@ def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=prin
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--maps", default=str(ROOT / "maps_gen" / "train"))
-    ap.add_argument("--heldout", default=str(ROOT / "maps_gen" / "heldout"))
+    ap.add_argument("--heldout", nargs="+", default=[str(ROOT / "maps_gen" / "heldout"), str(ROOT / "maps_gen" / "heldout2")],
+                    help="held-out map sets; the score is the map-count-weighted mean over them")
     ap.add_argument("--out", default=str(ROOT / "runs" / "dagger"))
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--workers", type=int, default=7)
@@ -208,8 +209,15 @@ def main():
             pool = pool[-a.max_pool:]
         train(model, pool, a.epochs, a.device, lr=a.lr, log=log)
         torch.save({"model": model.state_dict()}, out / "last.pt")
-        summary, _ = evaluate(a.heldout, "agent", str(out / "last.pt"), a.workers)
-        log(f"round {rnd} held-out: weighted {summary['weighted']:.1f} " + " ".join(f"t{k}: score {summary[f't{k}']['score']:.1f} exit {summary[f't{k}']['exit']:.2f} dead {summary[f't{k}']['dead']:.2f}" for k in (1, 2, 3, 4) if f"t{k}" in summary))
+        parts = [(evaluate(h, "agent", str(out / "last.pt"), a.workers)[0]) for h in a.heldout]
+        n_tot = sum(p_["maps"] for p_ in parts)
+        summary = {"weighted": sum(p_["weighted"] * p_["maps"] for p_ in parts) / n_tot}
+        for k in ("t1", "t2", "t3", "t4"):
+            if all(k in p_ for p_ in parts):
+                summary[k] = {f: sum(p_[k][f] * p_["maps"] for p_ in parts) / n_tot for f in ("score", "exit", "dead", "stuck")}
+        log(f"round {rnd} held-out ({n_tot} maps): weighted {summary['weighted']:.1f} " + " ".join(
+            f"t{k}: score {summary[f't{k}']['score']:.1f} exit {summary[f't{k}']['exit']:.2f} dead {summary[f't{k}']['dead']:.2f} stuck {summary[f't{k}']['stuck']:.2f}"
+            for k in (1, 2, 3, 4) if f"t{k}" in summary))
         if summary["weighted"] > best:
             best = summary["weighted"]
             torch.save({"model": model.state_dict(), "round": rnd, "heldout": summary}, out / "best.pt")
