@@ -33,14 +33,27 @@ GAME_W, GAME_H = 640, 480
 PANEL_H = 4 * 24 + 10  # status panel under the game view
 
 
-MAP_VIEW = 72      # cells shown around the agent (72 x 64 = 4608 map units)
-MAP_PX = 6         # pixels per cell
-COLORS = {"unknown": (40, 40, 46), "free": (150, 150, 140), "visited": (90, 140, 210), "wall": (240, 240, 240),
-          "door": (200, 140, 60), "locked": (230, 50, 50), "agent": (60, 230, 90)}
+MAP_SIZE = 480     # map panel size in pixels
+MAP_SPAN = 4600.0  # map units shown across the panel
+BG = (11, 15, 20)
+GRID = (24, 32, 42)
+FREE = (38, 84, 96)
+WALL_PT = (214, 226, 235)
+DOOR_PT = (255, 176, 64)
+LOCK_PT = (255, 72, 88)
+TRAJ = (64, 255, 160)
+KEYFRAME = (80, 150, 255)
+SCAN = (0, 210, 255)
+AGENT = (255, 255, 255)
 
 
 class MapView:
-    """One window: the game view on the left, the agent's own SLAM map on the right."""
+    """One window: the game view on the left, the agent's own SLAM map on the right.
+
+    Drawn like a modern SLAM viewer: a point cloud of everything the rays have hit (walls, doors,
+    locked doors), the explored free space, the trajectory with keyframes, the live scan and the
+    agent's pose with its field of view. All of it comes from the agent's own observations and actions.
+    """
 
     def __init__(self):
         import os
@@ -50,13 +63,31 @@ class MapView:
 
         self.pg = pygame
         pygame.init()
-        size = MAP_VIEW * MAP_PX
         self.mx = GAME_W + 8  # map panel x offset
-        self.screen = pygame.display.set_mode((GAME_W + 8 + size, max(GAME_H, size) + PANEL_H))
+        self.screen = pygame.display.set_mode((GAME_W + 8 + MAP_SIZE, max(GAME_H, MAP_SIZE) + PANEL_H))
         pygame.display.set_caption("DOOM agent: game view + SLAM map")
-        self.font = pygame.font.SysFont(None, 22)
+        self.font = pygame.font.SysFont("menlo,monaco,couriernew", 15)
+        self.small = pygame.font.SysFont("menlo,monaco,couriernew", 12)
+        self.traj: list[tuple[float, float]] = []
+        self.pts = {1: set(), 2: set(), 3: set()}  # hit points snapped to 8 units, by type
 
-    def draw(self, slam, info: str, frame=None) -> bool:
+    def _accumulate(self, slam, obs) -> list[tuple[float, float]]:
+        import math
+
+        import numpy as np
+
+        self.traj.append((slam.x, slam.y))
+        d = np.asarray(obs["rays"]["distance"], np.float64) * 1024.0
+        ht = np.asarray(obs["rays"]["hit_type"])
+        ang = slam.heading + np.arange(64) * (2 * math.pi / 64)
+        hx, hy = slam.x + np.cos(ang) * d, slam.y + np.sin(ang) * d
+        for k in range(64):
+            t = int(ht[k])
+            if t in self.pts and d[k] < 1023:
+                self.pts[t].add((round(hx[k] / 8) * 8, round(hy[k] / 8) * 8))
+        return [(hx[k], hy[k]) for k in range(64) if d[k] < 1023]
+
+    def draw(self, slam, info, frame=None, obs=None) -> bool:
         import math
 
         import numpy as np
@@ -66,32 +97,84 @@ class MapView:
         for e in pg.event.get():
             if e.type == pg.QUIT:
                 return False
-        cx = int(math.floor(slam.x / CELL)) + SIZE // 2
-        cy = int(math.floor(slam.y / CELL)) + SIZE // 2
-        half = MAP_VIEW // 2
-        ys, xs = np.mgrid[cy + half - 1:cy - half - 1:-1, cx - half:cx + half]  # north up
+        scan = self._accumulate(slam, obs) if obs is not None else []
+        S, sc = MAP_SIZE, MAP_SIZE / MAP_SPAN
+        cxw, cyw = slam.x, slam.y
+
+        def to_px(x, y):
+            return (S / 2 + (x - cxw) * sc, S / 2 - (y - cyw) * sc)
+
+        panel = pg.Surface((S, S), 0, 24)  # opaque: no alpha channel
+        panel.fill(BG)
+        # explored free space: occupancy grid, smoothly scaled, drawn softly under everything else
+        half = int(MAP_SPAN / CELL / 2) + 1
+        ccx, ccy = int(math.floor(cxw / CELL)) + SIZE // 2, int(math.floor(cyw / CELL)) + SIZE // 2
+        ys, xs = np.mgrid[ccy + half:ccy - half - 1:-1, ccx - half:ccx + half + 1]
         ok = (xs >= 0) & (xs < SIZE) & (ys >= 0) & (ys < SIZE)
-        xs, ys = np.clip(xs, 0, SIZE - 1), np.clip(ys, 0, SIZE - 1)
-        free, hit, vis = slam.free[ys, xs] * ok, slam.hit[ys, xs] * ok, slam.visit[ys, xs] * ok
-        img = np.empty((MAP_VIEW, MAP_VIEW, 3), np.uint8)
-        img[:] = COLORS["unknown"]
-        img[free > 0] = COLORS["free"]
-        img[vis > 0] = COLORS["visited"]
-        img[hit == 1] = COLORS["wall"]
-        img[hit == 2] = COLORS["door"]
-        img[hit == 3] = COLORS["locked"]
-        surf = pg.surfarray.make_surface(np.repeat(np.repeat(img, MAP_PX, 0), MAP_PX, 1).transpose(1, 0, 2))
-        self.screen.fill((0, 0, 0))
+        free = slam.free[np.clip(ys, 0, SIZE - 1), np.clip(xs, 0, SIZE - 1)] * ok
+        img = np.zeros(free.shape + (3,), np.uint8)
+        img[free > 0] = FREE
+        img[free == 0] = BG
+        surf = pg.surfarray.make_surface(img.transpose(1, 0, 2))
+        wpx = int(round(free.shape[1] * CELL * sc))
+        surf = pg.transform.smoothscale(surf, (wpx, wpx))
+        ox, oy = to_px((ccx - half - SIZE // 2) * CELL, (ccy + half + 1 - SIZE // 2) * CELL)
+        panel.blit(surf, (ox, oy))
+        # grid every 256 map units
+        g0x, g0y = math.floor((cxw - MAP_SPAN / 2) / 256) * 256, math.floor((cyw - MAP_SPAN / 2) / 256) * 256
+        for n in range(int(MAP_SPAN // 256) + 2):
+            x = to_px(g0x + n * 256, 0)[0]
+            y = to_px(0, g0y + n * 256)[1]
+            pg.draw.line(panel, GRID, (x, 0), (x, S))
+            pg.draw.line(panel, GRID, (0, y), (S, y))
+        # live scan: faint rays from the agent to this step's hits
+        overlay = pg.Surface((S, S), pg.SRCALPHA)
+        a0 = to_px(slam.x, slam.y)
+        for hx, hy in scan:
+            pg.draw.aaline(overlay, SCAN + (38,), a0, to_px(hx, hy))
+        # field of view wedge (90 degrees)
+        fov = [a0] + [to_px(slam.x + 520 * math.cos(slam.heading + t), slam.y + 520 * math.sin(slam.heading + t))
+                      for t in np.linspace(-math.pi / 4, math.pi / 4, 12)]
+        pg.draw.polygon(overlay, (255, 255, 255, 22), fov)
+        panel.blit(overlay, (0, 0))
+        # point cloud of everything the rays have hit
+        for t, col, r in ((1, WALL_PT, 1), (2, DOOR_PT, 2), (3, LOCK_PT, 2)):
+            for x, y in self.pts[t]:
+                px, py = to_px(x, y)
+                if 0 <= px < S and 0 <= py < S:
+                    if r == 1:
+                        panel.set_at((int(px), int(py)), col)
+                    else:
+                        pg.draw.circle(panel, col, (int(px), int(py)), r)
+        # trajectory with keyframes
+        if len(self.traj) > 1:
+            pg.draw.aalines(panel, TRAJ, False, [to_px(x, y) for x, y in self.traj])
+            for x, y in self.traj[::20]:
+                px, py = to_px(x, y)
+                pg.draw.rect(panel, KEYFRAME, (px - 2, py - 2, 5, 5), 1)
+        # agent pose: arrowhead
+        h = slam.heading
+        tip = to_px(slam.x + 110 * math.cos(h), slam.y + 110 * math.sin(h))
+        l = to_px(slam.x + 60 * math.cos(h + 2.5), slam.y + 60 * math.sin(h + 2.5))
+        r_ = to_px(slam.x + 60 * math.cos(h - 2.5), slam.y + 60 * math.sin(h - 2.5))
+        pg.draw.polygon(panel, AGENT, [tip, l, r_])
+        pg.draw.aalines(panel, TRAJ, True, [tip, l, r_])
+        # legend + stats
+        n_pts = sum(len(v) for v in self.pts.values())
+        panel.blit(self.small.render(f"SLAM  |  map points {n_pts}  keyframes {len(self.traj) // 20 + 1}  pose ({slam.x:.0f}, {slam.y:.0f}, {math.degrees(h) % 360:.0f} deg)", True, (150, 170, 185)), (8, 6))
+        lx = 8
+        for name, col in (("wall", WALL_PT), ("door", DOOR_PT), ("locked door", LOCK_PT), ("path", TRAJ), ("scan", SCAN), ("free space", (70, 140, 155))):
+            pg.draw.circle(panel, col, (lx + 4, S - 12), 4)
+            lab = self.small.render(name, True, (150, 170, 185))
+            panel.blit(lab, (lx + 12, S - 19))
+            lx += 22 + lab.get_width()
+        pg.draw.rect(panel, (40, 52, 66), (0, 0, S, S), 1)
+
+        self.screen.fill((6, 8, 11))
         if frame is not None and frame.ndim == 3:
             self.screen.blit(pg.surfarray.make_surface(np.ascontiguousarray(frame.transpose(1, 0, 2))), (0, 0))
-        self.screen.blit(surf, (self.mx, 0))
-        # agent: dot + heading line at the centre cell
-        px = self.mx + half * MAP_PX + MAP_PX // 2
-        py = (half - 1) * MAP_PX + MAP_PX // 2
-        hx, hy = px + 18 * math.cos(slam.heading), py - 18 * math.sin(slam.heading)
-        pg.draw.line(self.screen, COLORS["agent"], (px, py), (hx, hy), 3)
-        pg.draw.circle(self.screen, COLORS["agent"], (px, py), 5)
-        y0 = max(GAME_H, MAP_VIEW * MAP_PX) + 6
+        self.screen.blit(panel, (self.mx, 0))
+        y0 = max(GAME_H, MAP_SIZE) + 8
         for i, (text, color) in enumerate(info):
             self.screen.blit(self.font.render(text, True, color), (8, y0 + 24 * i))
         pg.display.flip()
@@ -188,7 +271,7 @@ def main():
                     (f"SURVIVAL   health: {int(v[0])}   armor: {int(v[1])}   ammo: {int(v[3])}   {'DEAD' if res.dead else 'alive'}"
                      f"      our score estimate: {res.score():.0f}", bad if res.dead or v[0] < 30 else white),
                 ]
-                if not view.draw(slam, lines, obs.get("rgb")):
+                if not view.draw(slam, lines, obs.get("rgb"), obs):
                     view = None
             if term or trunc:
                 break
