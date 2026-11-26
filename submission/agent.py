@@ -33,14 +33,27 @@ class DoomAgent:
         self.action_space = action_space
         torch.set_num_threads(1)
         self.device = torch.device("cpu")
-        self.model = Policy()
-        path = Path(weights_path) if weights_path else WEIGHTS_DIR / "policy.pt"
+        # One or more trained networks. With several, their action probabilities are averaged (an ensemble):
+        # every decision still comes from trained parameters, and averaging makes play more consistent.
+        if weights_path:
+            paths = [Path(p) for p in str(weights_path).split(",")]
+        else:
+            paths = sorted(WEIGHTS_DIR.glob("policy*.pt"))
+        self.models = []
         self.loaded = False
-        if path.is_file():
-            state = torch.load(path, map_location="cpu", weights_only=True)
-            load_compatible(self.model, state["model"] if "model" in state else state)
-            self.loaded = True
-        self.model.eval()
+        for path in paths:
+            if path.is_file():
+                m = Policy()
+                state = torch.load(path, map_location="cpu", weights_only=True)
+                load_compatible(m, state["model"] if "model" in state else state)
+                m.eval()
+                self.models.append(m)
+                self.loaded = True
+        if not self.models:
+            m = Policy()
+            m.eval()
+            self.models.append(m)
+        self.model = self.models[0]
         self.rng = np.random.default_rng(0)
         self.perception = Perception()
         self.reset()
@@ -56,7 +69,7 @@ class DoomAgent:
 
     def reset(self) -> None:
         """Called before every map: clear the recurrent memory and the action history."""
-        self.h = self.model.initial_state(1)
+        self.hs = [m.initial_state(1) for m in self.models]
         self.prev_action = 0
         self.rng = np.random.default_rng(0)
         self.perception.reset()
@@ -64,8 +77,13 @@ class DoomAgent:
     def act(self, observation: dict) -> np.ndarray:
         try:
             x = torch.from_numpy(self.perception.see(observation)).unsqueeze(0)
-            logits, _, self.h = self.model.step(x, torch.tensor([self.prev_action]), self.h)
-            logits = logits[0].double().numpy()
+            pa = torch.tensor([self.prev_action])
+            probs = None
+            for k, m in enumerate(self.models):
+                lg, _, self.hs[k] = m.step(x, pa, self.hs[k])
+                p_k = torch.softmax(lg[0].double(), -1).numpy()
+                probs = p_k if probs is None else probs + p_k
+            logits = np.log(np.maximum(probs / len(self.models), 1e-12))  # log of the averaged probabilities
             if self.prev_action in USE_ACTIONS:
                 logits[list(USE_ACTIONS)] = -np.inf
             if self.prev_action in NEXTW_ACTIONS:
@@ -82,6 +100,6 @@ class DoomAgent:
             return buttons
         except Exception:  # never crash: a crash freezes the player for the rest of the map
             self.prev_action = 1
-            self.h = self.model.initial_state(1)
+            self.hs = [m.initial_state(1) for m in self.models]
             self.perception.did(to_buttons(1))
             return to_buttons(1)  # move forward

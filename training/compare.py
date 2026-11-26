@@ -34,7 +34,7 @@ def run_one(args):
     mod = importlib.util.module_from_spec(spec)
     sys.modules["submission_agent"] = mod
     spec.loader.exec_module(mod)
-    env = make_env(item["path"], item.get("map", "MAP01"), episode_ticks=item["ticks"], render_buffers=False)
+    env = make_env(item["path"], item.get("map", "MAP01"), episode_ticks=item["ticks"], render_buffers=True)  # frames on, as in the real scorer
     obs, _ = env.reset(seed=seed)
     agent = mod.DoomAgent(env.observation_space, env.action_space, "cpu")
     agent.reset()

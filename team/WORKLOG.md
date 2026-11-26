@@ -10,16 +10,15 @@ compare our own checkpoints with each other; they are not leaderboard scores.
 - The weighted score is: tier-1 average + 1.5 × tier-2 + 2 × tier-3 + 3 × tier-4 (per-map averages).
 - A single map tops out at roughly 140–270 points, so a perfect weighted score would be about 1,645.
 
-## Current state (updated 01:35)
+## Current state (final, 02:10)
 
 | | |
 |---|---|
-| Submitted agent (branch `yash`) | Planner network trained with imitation + self-imitation RL + map curiosity, round 3 |
-| Its score, 180 maps | 860 and 762 on two seed sets (previous agent: 825 and 790) |
-| Its score, 80 maps from `main`'s generator | 971 (previous agent: 973) |
-| `main` branch agent (20:25 weights) | 475 on our 180 maps, 561 on its own generator's 80 maps |
-| Brief | `team/Project_Brief_Track1.pdf` (2 pages) |
-| Running | Last run: actor-critic term, learned curiosity, blocked/stuck penalties. 760 → 728 → 799 so far |
+| Team submission | **`main`**: the network trained here, plus image-based door colours, exit detection and a jam mask added on `main` |
+| `main` vs `yash`, 180 maps | 884 vs 762 |
+| `main` vs `yash`, 80 maps from `main`'s generator | 1,081 vs 971 |
+| This branch (`yash`) | The training record: imitation + self-imitation RL + map curiosity; 860 / 762 / 805 on three seed sets of the 180 maps |
+| Brief | `team/Project_Brief_Track1.pdf` (describes the `yash` agent) |
 
 ---
 
@@ -165,6 +164,35 @@ between seed sets.
 
 Per-tier picture of the submitted agent across the three test sets (exit rate): combat 33–60%,
 exploration 42–65%, keycard 51–71%, gauntlet 9–15%.
+
+### 01:35–02:10 · Last attempts and the final comparison with `main`
+
+| Tried | Result | Kept? |
+|---|---|---|
+| Last run (actor-critic term, learned curiosity, blocked/stuck penalties), 4 rounds | 760 → 728 → 799 → 803 on 180 maps; submitted agent 860 on the same seeds | **No**, stopped at the freeze |
+| Ensemble of 2 networks (probabilities averaged) | 180 maps: 832 vs 860 (seed set A), 851 vs 805 (fresh seeds); neutral maps 869 vs 943 | **No**: mixed. Support for it stays in `agent.py`; with one weights file it behaves exactly as before |
+| Ensemble of 3 networks | 786 vs 860 | **No** |
+
+**Final comparison with `main` (its 00:53 version), frames on, same maps and seeds, clean checkouts:**
+
+| Test set | `main` | `yash` | |
+|---|---|---|---|
+| 180 maps from our generator | 884 | 762 | `main` +16% |
+| 80 maps from `main`'s generator | 1,081 | 971 | `main` +11% |
+
+`main` is better on both sets and in every heavily weighted tier; on gauntlets it reaches the exit twice as
+often (30% vs 15% on its own maps) and is stuck half as much (8–9% vs 17%).
+
+What `main` is: **the same trained network as `yash`** (the weights files are byte-identical), plus three
+additions around it: locked-door colours read from the camera image (doors the agent cannot open yet are
+shown to the network as walls), exit pads read from the image and marked in the map, and a mask that
+withholds "forward" for a few steps when the agent pushes without moving.
+
+What we got wrong on `yash`: we treated a lock's colour as unobservable and tried to train around it with a
+"tried door" memory that was only half learned. The colour is in the camera image. We had dropped pixels
+at the start and did not come back to them for the one fact the rays do not carry.
+
+**Conclusion: `main` is the team's submission.** `yash` is the record of how the network was trained.
 
 ---
 
