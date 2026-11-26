@@ -56,37 +56,44 @@ def main() -> None:
 
     import pygame
 
-    if args.wad:
-        wad, _, map_name = args.wad.partition(":")
-        env = make_env(wad, map_name or "MAP01", episode_ticks=4200)
-        score = EpisodeScore()
-        title = args.wad
-    else:
-        lvl = make_level(args.seed, args.tier)
-        wad = Path(tempfile.gettempdir()) / f"watch_{os.getpid()}.wad"
-        write_level(lvl, wad)
-        env = make_env(wad, episode_ticks=lvl["ticks"])
-        score = EpisodeScore(lvl["monsters"], max(1, lvl["floor_cells"] * lvl["cell"] ** 2 // 128**2))
-        title = f"seed {args.seed}  tier {lvl['tier']}"
-    obs, _ = env.reset(seed=args.seed)
-    score.update(env.privileged_state())
-    if args.policy == "teacher":
-        from training.teacher import Teacher
-        policy = Teacher()
-        policy.reset(env)
-        mapper = lambda: policy.map
-    else:
-        from training.play import AgentPolicy
-        policy = AgentPolicy()
-        policy.reset(env)
-        mapper = lambda: getattr(policy.agent, "mapper", None)
+    def start(seed: int):
+        """Build the level, the policy and the scorer for one episode."""
+        if args.wad:
+            wad, _, map_name = args.wad.partition(":")
+            env = make_env(wad, map_name or "MAP01", episode_ticks=4200)
+            score = EpisodeScore()
+            title = args.wad
+        else:
+            lvl = make_level(seed, args.tier)
+            wad = Path(tempfile.gettempdir()) / f"watch_{os.getpid()}.wad"
+            write_level(lvl, wad)
+            env = make_env(wad, episode_ticks=lvl["ticks"])
+            score = EpisodeScore(lvl["monsters"], max(1, lvl["floor_cells"] * lvl["cell"] ** 2 // 128**2))
+            title = f"seed {seed}  tier {lvl['tier']}"
+        obs, _ = env.reset(seed=seed)
+        score.update(env.privileged_state())
+        if args.policy == "teacher":
+            from training.teacher import Teacher
+            policy = Teacher()
+            policy.reset(env)
+            mapper = lambda: policy.map
+        else:
+            from training.play import AgentPolicy
+            policy = AgentPolicy()
+            policy.reset(env)
+            mapper = lambda: getattr(policy.agent, "mapper", None)
+        return env, score, title, obs, policy, mapper
+
+    seed = args.seed
+    env, score, title, obs, policy, mapper = start(seed)
 
     pygame.init()
     screen = pygame.display.set_mode((VIEW * 2 + 12, VIEW + 56))
-    pygame.display.set_caption(f"DevForge DOOM viewer - {args.policy} - {title}")
+    who = "TEACHER (scripted)" if args.policy == "teacher" else "NEURAL NETWORK"
+    pygame.display.set_caption(f"DevForge DOOM viewer - {who} - {title}")
     font = pygame.font.SysFont("consolas", 16)
     clock = pygame.time.Clock()
-    paused, done, steps, fps = False, False, 0, args.fps
+    paused, done, steps, fps, over_at = False, False, 0, args.fps, 0
     names = ("FWD", "BACK", "LEFT", "RIGHT", "TURN-L", "TURN-R", "FIRE", "USE", "WEAPON")
     action = np.zeros(9, np.int8)
     running = True
@@ -112,6 +119,15 @@ def main() -> None:
             done = term or trunc or (args.max_steps and steps >= args.max_steps)
             if args.max_steps and steps >= args.max_steps:
                 running = False
+        if done and running and not args.max_steps:
+            over_at = over_at or pygame.time.get_ticks()
+            if pygame.time.get_ticks() - over_at > 2500:  # show the result briefly, then play the next level
+                print(title, score.result(), flush=True)
+                env.close()
+                seed += 1 if args.tier else 4 if not args.wad else 0
+                env, score, title, obs, policy, mapper = start(seed)
+                pygame.display.set_caption(f"DevForge DOOM viewer - {who} - {title}")
+                done, steps, over_at = False, 0, 0
         screen.fill((16, 16, 20))
         frame = pygame.surfarray.make_surface(np.ascontiguousarray(obs["rgb"].transpose(1, 0, 2)))
         screen.blit(pygame.transform.scale(frame, (VIEW, VIEW * 3 // 4)), (0, 0))
@@ -127,7 +143,7 @@ def main() -> None:
         lines = [
             f"step {steps}  hp {v[0]:.0f}  ammo {v[3]:.0f}  keys {int(v[8:14].sum())}   buttons: " + " ".join(n for n, b in zip(names, action) if b),
             f"score {r['score']:.1f}  exit {r['exit']}  doors {r['doors']}  locked {r['locked']}  explored {r['explore']:.0%}  kills {r['kills']}"
-            + ("   [PAUSED]" if paused else "") + ("   [EPISODE OVER]" if done else "") + f"   {fps:.0f} steps/s",
+            + ("   [PAUSED]" if paused else "") + ("   [LEVEL OVER - next level in a moment]" if done else "") + f"   {fps:.0f} steps/s",
         ]
         for i, text in enumerate(lines):
             screen.blit(font.render(text, True, (220, 220, 220)), (8, VIEW + 6 + 22 * i))
