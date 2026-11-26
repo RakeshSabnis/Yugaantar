@@ -21,11 +21,8 @@ G = 512  # grid cells per side (8192 units; the spawn is at the centre, indices 
 RAY_RANGE = 1024.0
 NUM_RAYS = 64
 # layers
-# USED: doors we have pressed USE on. COVERED: ground we have walked close to. FRONTIER: seen free
-# space bordering unseen space (recomputed from the other layers every step).
-FREE, WALL, DOOR, LOCKED, VISITED, KEY, EXIT, USED, COVERED, FRONTIER = range(10)
-NUM_LAYERS = 10
-USE_RANGE = 72.0  # a door this close straight ahead is the one a USE press acts on
+FREE, WALL, DOOR, LOCKED, VISITED, KEY, EXIT = range(7)
+NUM_LAYERS = 7
 CROP = 32  # crop side in pixels
 FINE = 2  # fine crop: 2x2 cells (32 units) per pixel, +-512 units
 COARSE = 8  # coarse crop: 8x8 cells (128 units) per pixel, +-2048 units
@@ -73,7 +70,6 @@ class Mapper:
         self.x = self.y = self.h = 0.0
         self.turn_held = 0
         self.tic = 0
-        self.ahead = None  # grid cell of the door straight ahead at the last observation, if any
         self.exit_false = 0  # times we stood on a "detected exit" and the level did not end
         self.prev_vel = np.zeros(2)  # world frame
         self.steps = 0
@@ -111,18 +107,8 @@ class Mapper:
         if dead_reckon:
             self._dead_reckon(obs["vitals"], prev_action)
         L = self.layers
-        if prev_action is not None and prev_action[7] and self.ahead is not None:
-            ax, ay = self.ahead  # we pressed USE facing this door: remember it as already tried
-            r = np.arange(-4, 5)
-            L[USED, ((ax + r) % G)[:, None], ((ay + r) % G)[None, :]] = 1
         dist = np.asarray(obs["rays"]["distance"], np.float64) * RAY_RANGE
         hit = np.asarray(obs["rays"]["hit_type"])
-        self.ahead = None
-        for k in (0, 1, 63):
-            if hit[k] in (2, 3) and dist[k] < USE_RANGE:
-                hx, hy = self.cell(self.x + math.cos(self.h) * (dist[k] + 10.0), self.y + math.sin(self.h) * (dist[k] + 10.0))
-                self.ahead = (int(hx), int(hy))
-                break
         ang = self.h + _RAY_ANG
         ca, sa = np.cos(ang), np.sin(ang)
         # free space along every ray, up to just before the hit
@@ -146,8 +132,6 @@ class Mapper:
                     L[layer, hx[m], hy[m]] = 1
         px, py = self.cell(self.x, self.y)
         L[VISITED, px, py] = 1
-        r3 = np.arange(-3, 4)
-        L[COVERED, ((px + r3) % G)[:, None], ((py + r3) % G)[None, :]] = 1
         L[FREE, px, py] = 1
         L[KEY, ((px + np.arange(-2, 3)) % G)[:, None], ((py + np.arange(-2, 3)) % G)[None, :]] = 0  # picked up / walked over
         ents = obs["visible_entities"]
@@ -195,17 +179,6 @@ class Mapper:
         self.steps += 1
 
     # ------------------------------------------------------------------ network input
-    def _frontier(self) -> None:
-        L = self.layers
-        wall = L[WALL] > 0
-        known = (L[FREE] | L[WALL] | L[DOOR] | L[LOCKED]) > 0
-        near = wall | np.roll(wall, 1, 0) | np.roll(wall, -1, 0)
-        near = near | np.roll(near, 1, 1) | np.roll(near, -1, 1)
-        # unknown cells right next to a known wall are gaps between ray hits, not openings
-        cand = ~known & ~near
-        cand = cand | np.roll(cand, 1, 0) | np.roll(cand, -1, 0) | np.roll(cand, 1, 1) | np.roll(cand, -1, 1)
-        L[FRONTIER] = (L[FREE] > 0) & cand
-
     def _sample(self, offs) -> np.ndarray:
         fwd, left = offs
         c, s = math.cos(self.h), math.sin(self.h)
@@ -214,7 +187,6 @@ class Mapper:
 
     def crops(self) -> np.ndarray:
         """(2 * NUM_LAYERS, CROP, CROP) float32: fine crop then coarse crop, forward = up."""
-        self._frontier()
         fine = self._sample(_FINE).reshape(NUM_LAYERS, CROP, FINE, CROP, FINE).max(axis=(2, 4))
         coarse = self._sample(_COARSE).reshape(NUM_LAYERS, CROP, COARSE, CROP, COARSE).max(axis=(2, 4))
         return np.concatenate([fine, coarse]).astype(np.float32)

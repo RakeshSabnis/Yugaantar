@@ -66,18 +66,9 @@ class AgentPolicy:
 
     def __init__(self):
         import sys
-        from doom_env.spaces import action_space, observation_space
-        other = os.environ.get("DOOM_AGENT_DIR")  # score another checkout's agent on the same levels
-        if other:
-            import importlib.util
-            sys.path[:0] = [str(Path(other) / "submission"), other]
-            spec = importlib.util.spec_from_file_location("other_agent", Path(other) / "submission" / "agent.py")
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            self.agent = mod.DoomAgent(observation_space(), action_space(), "cpu")
-            return
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "submission"))
         from submission.agent import DoomAgent
+        from doom_env.spaces import action_space, observation_space
         self.agent = DoomAgent(observation_space(), action_space(), "cpu")
 
     def reset(self, env):
