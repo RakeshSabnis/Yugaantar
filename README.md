@@ -23,6 +23,19 @@ its map; it turns back into a locked door when the key is picked up. This is obs
 preprocessing only. On 192 held-out levels with the same weights it raised the local score from
 1073 to 1108 (tier 3 exits 42% -> 50%, tier 4 12% -> 15%; tiers without locks unchanged).
 
+## Exit pads from the frame, and a mask for jams
+
+Two more pieces of preprocessing and masking, both measured on the same 192 held-out levels with the
+same weights (local score 1108 -> 1141; exits on tiers 1-3 from 65/67/50% to 75/71/58%):
+
+- **Exit pads.** Neither rays nor entities show the exit. `submission/slam.py` finds the exit pad's red
+  floor in the frame, places it with the depth buffer, and presents those map cells to the network as
+  frontier, which it has learned to walk towards. Upright red things (blood, corpses, fireballs) are
+  rejected because their pixels share one depth, and frames tinted by damage are skipped.
+- **Jam mask.** If the agent has pressed forward for several steps without moving and is not waiting
+  at a door, forward is withheld for a few steps, so the network's own next choice (side-step, turn,
+  back) frees it. This is action masking from observation fields; the network still chooses.
+
 ## Repository layout
 
 ```

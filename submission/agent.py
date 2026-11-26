@@ -8,6 +8,7 @@ edge-triggered, so pressing them twice in a row is masked out). Sampling uses on
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -19,10 +20,15 @@ sys.path.insert(0, str(SUBMISSION_DIR))
 
 import torch  # noqa: E402
 
-from actions import NEXTW_ACTIONS, NUM_ACTIONS, USE_ACTIONS, to_buttons  # noqa: E402
+from actions import COMBOS, NEXTW_ACTIONS, NUM_ACTIONS, USE_ACTIONS, to_buttons  # noqa: E402
 from model import Perception, Policy, load_compatible  # noqa: E402
 
 TEMPERATURE = float(__import__("os").environ.get("DOOM_TEMPERATURE", "0.5"))  # low-temperature sampling: mostly the best action, enough noise to escape loops
+
+
+FORWARD_ACTIONS = tuple(i for i, c in enumerate(COMBOS) if 0 in c)
+UNSTICK = __import__("os").environ.get("DOOM_UNSTICK", "1") == "1"
+STUCK_STEPS, MASK_STEPS = 6, 5
 
 
 class DoomAgent:
@@ -60,6 +66,8 @@ class DoomAgent:
         self.prev_action = 0
         self.rng = np.random.default_rng(0)
         self.perception.reset()
+        self.stuck = 0
+        self.no_forward = 0
 
     def act(self, observation: dict) -> np.ndarray:
         try:
@@ -70,6 +78,21 @@ class DoomAgent:
                 logits[list(USE_ACTIONS)] = -np.inf
             if self.prev_action in NEXTW_ACTIONS:
                 logits[list(NEXTW_ACTIONS)] = -np.inf
+            if UNSTICK:
+                # Action masking from observation fields: if we have been pressing forward without
+                # moving (and are not just waiting at a door), forward is withheld for a few steps,
+                # so the network's own next-best choice (side-step, turn, back) gets us free.
+                v = np.nan_to_num(np.asarray(observation["vitals"], np.float64).reshape(-1))
+                rd = np.asarray(observation["rays"]["distance"], np.float64).reshape(-1) * 1024.0
+                rt = np.asarray(observation["rays"]["hit_type"]).reshape(-1)
+                at_door = any(rt[k] in (2, 3) and rd[k] < 96.0 for k in (0, 1, 63))
+                jammed = self.prev_action in FORWARD_ACTIONS and math.hypot(v[14], v[15]) < 0.5 and not at_door
+                self.stuck = self.stuck + 1 if jammed else 0
+                if self.stuck >= STUCK_STEPS:
+                    self.no_forward, self.stuck = MASK_STEPS, 0
+                if self.no_forward > 0:
+                    self.no_forward -= 1
+                    logits[list(FORWARD_ACTIONS)] = -np.inf
             if not np.all(np.isfinite(logits[np.isfinite(logits)])) or not np.isfinite(logits).any():
                 raise ValueError("bad logits")
             z = (logits - logits[np.isfinite(logits)].max()) / TEMPERATURE
