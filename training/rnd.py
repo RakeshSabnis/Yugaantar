@@ -6,7 +6,7 @@ badly, so the prediction error is used as an intrinsic "novelty" reward.
 
 Input: the encoded observation (rays, entities, vitals) plus the zoomed-out view of the agent's own SLAM
 map, so novelty is about where the agent is and what it sees, not about noise.
-Used in training only (training/ppo.py); the submitted agent does not contain or need it.
+Used in training only (training/dagger.py); the submitted agent does not contain or need it.
 """
 from __future__ import annotations
 
