@@ -10,14 +10,15 @@ compare our own checkpoints with each other; they are not leaderboard scores.
 - The weighted score is: tier-1 average + 1.5 × tier-2 + 2 × tier-3 + 3 × tier-4 (per-map averages).
 - A single map tops out at roughly 140–270 points, so a perfect weighted score would be about 1,645.
 
-## Current state (updated 23:20)
+## Current state (updated 00:05)
 
 | | |
 |---|---|
-| Submitted agent (branch `yash`) | Planner network, imitation round 5: **825 on 180 maps** |
-| `main` branch agent, same maps and seeds | 489 |
-| Teacher (training only) | about 1,300 on 60 maps |
-| Running | Imitation + self-imitation RL + curiosity, with the key-aware map |
+| Submitted agent (branch `yash`) | Planner network trained with imitation + self-imitation RL + curiosity, round 3 |
+| Its score, 180 maps | 860 and 762 on two seed sets (previous agent: 825 and 790) |
+| Its score, 80 maps from `main`'s generator | 971 (previous agent: 973) |
+| `main` branch agent (20:25 weights) | 475 on our 180 maps, 561 on its own generator's 80 maps |
+| Running | Further rounds of the same run, until about 01:00 |
 
 ---
 
@@ -126,6 +127,28 @@ Findings:
 | **Self-imitation RL inside the imitation loop**: value head regresses the return; actions that did better than expected are reinforced | Smoke test passes | In training now |
 | **Curiosity reward from the agent's own map**: bonus for entering a map cell it has never stood in | Part of the RL reward | In training now |
 
+### 23:20–00:05 · Comparison with `main`, first RL agent
+
+Both branches scored from clean checkouts of what is pushed, same maps, same seeds, same scorer
+(`training/compare.py`).
+
+| Test set | `main` | `yash` (825 agent) | Lead |
+|---|---|---|---|
+| 180 maps from our generator | 475 | 790 | +66% |
+| 80 maps from `main`'s generator (other cell sizes, random start directions) | 561 | 973 | +73% |
+
+`yash` is ahead on score and exit rate in every tier on both sets. `main` is better at two things: it dies
+less (0–15% vs 10–25% on its own maps) and gets stuck less (4–6% of steps vs 8–16%).
+
+| Tried | Result | Kept? |
+|---|---|---|
+| Run with imitation + self-imitation RL + curiosity + key-aware map | 745 → 735 → 740 → **860** (180 maps) | Yes |
+| Checked the 860 checkpoint on a second seed set and on `main`-style maps | 762 (previous agent 790) and 971 (previous 973): a tie overall | **Yes: submitted**, because at equal score it is the agent that actually contains the RL stage, the curiosity reward and the fixed map |
+| Gauntlet analysis on the new agent | Lock 1 opened 14 → 17, key 2 10 → 14, lock 2 4 → 8, exits 2 → 3; but time at doors it cannot open 11% → 22%, deaths 12 → 17 | The tried-door memory is not yet used well; training continues |
+
+Lesson: one score on one seed set is not enough to pick a checkpoint. The same agent moves by about ±40
+between seed sets.
+
 ---
 
 ## What we are going ahead with
@@ -139,7 +162,7 @@ Findings:
 
 ## Things that did not work (short list)
 
-- PPO fine-tuning, three configurations: always lowered the score.
+- PPO fine-tuning, three configurations: always lowered the score. (Self-imitation RL, tried later, did not.)
 - Scan matching for heading: much worse than the action-based turn model.
 - Teacher detours for health and shotgun: slightly worse.
 - Weight averaging of consecutive rounds: worse than the better round.
