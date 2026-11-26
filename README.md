@@ -1,88 +1,82 @@
-# devforge-doom-template
+# Can It Play DOOM? — Yugaantar DevForge, Track 1
 
-Starter template for **Yugaantar 2026 · DevForge — Track 1: "Can It Play DOOM?"**
+A neural agent that plays unseen DOOM levels: it explores, fights, finds keycards, opens locked doors and
+looks for the exit. Built from the official `devforge-doom-template` during the hackathon.
 
-> For decades, *"Can it run DOOM?"* was the ultimate hardware test. Now: **can your neural network
-> actually play DOOM?** Train an agent that plays unseen levels **zero-shot**: survive ambushes,
-> navigate multi-room layouts, find keycards, unlock doors and reach the exit.
+Every action comes from the trained network in `submission/`. There is no scripted decision logic,
+pathfinding or aim maths in the submitted agent.
 
-No dataset is provided. Your agent learns by interacting with the engine.
+## Approach in one paragraph
 
-## Quickstart
-
-1. Click **"Use this template"** on GitHub to create your team's (public) repository.
-2. Set up the environment (Python 3.13, [uv](https://docs.astral.sh/uv/)):
-
-   ```bash
-   uv sync                 # installs vizdoom, gymnasium and the official wrapper (env/) in editable mode
-   uv run python validate.py
-   ```
-
-   Or use the official image, which is exactly what the scorer runs:
-
-   ```bash
-   docker build -t devforge-doom .            # or: docker pull <official image tag, announced>
-   python validate.py --docker --image devforge-doom   # installs requirements.txt, then runs sandboxed like the scorer
-   ```
-
-3. Replace the random baseline in `submission/agent.py` with your trained agent.
-4. Put weights in `submission/weights/` (Git LFS) and training code in `training/`.
-5. Run `python validate.py --docker` and submit your repo URL.
-
-**Platforms:** Linux (x86-64/ARM), macOS on Apple Silicon (macOS 15+) and Windows (x86-64) all
-work with `uv sync` and `validate.py`. Intel Macs have no `vizdoom` 1.3.3 wheel: use Docker or a
-Linux machine. Evaluation runs on Linux, so `validate.py --docker` is the closest check.
+Pure reinforcement learning rarely discovers keycard → locked door → exit in a few hours. We first train
+the network to imitate a **training-only scripted teacher** with DAgger (the network plays, the teacher
+labels every state it visits, so the network learns to recover from its own mistakes), and we built our
+own recurrent PPO for fine-tuning. The agent keeps its own **SLAM-style map** of the level, built only
+from its observations and its own actions, and reads it through a **learned planner module**.
 
 ## Repository layout
 
 ```
-env/                  official ViZDoom Gymnasium wrapper (doom_env): spaces, sensors, protocol, limits
-maps/                 one small test map (NOT an evaluation map); bring your own for training
-submission/agent.py   your DoomAgent: the evaluation entry point
-submission/weights/   model weights (Git LFS)
-training/             your training pipeline
-validate.py           run before submitting
-tests/                tests for the wrapper and validator (uv run pytest)
-docs/                 contract, rules, submission guide, evaluation details
+submission/agent.py      DoomAgent: the evaluation entry point (network + safety guard)
+submission/model.py      policy network and observation encoding
+submission/slam.py       occupancy map + odometry from the 64 rays and the agent's own actions
+submission/actions.py    the 23 button combinations the policy chooses from
+submission/weights/      trained weights (Git LFS)
+
+training/mapgen.py       procedural maps in the organisers' ASCII-grid UDMF format, all four tiers
+training/teacher.py      scripted teacher (TRAINING ONLY): frontier exploration, keys, doors, combat
+training/dagger.py       imitation learning (DAgger)
+training/ppo.py          our recurrent PPO (rewards mirror the scoring categories)
+training/scorer.py       local estimate of the official scoring, from privileged state
+training/evaluate.py     score a policy on a held-out map set
+training/compare.py      score any checkout's agent on the same maps and seeds
+training/watch.py        watch the agent play, with its SLAM map and objectives panel
+
+env/ docs/ tests/ validate.py   the official template, unchanged
 ```
 
-## Using the environment
+## The agent
 
-```python
-from doom_env import make_env
+| Module | Design |
+|---|---|
+| Rays | circular 1D-CNN over the 64 rays (distance, near-ness, hit type) |
+| Entities | per-entity MLP + type embedding, masked attention pooling and max pooling |
+| Vitals | MLP over normalised vitals and the agent's previous action |
+| Spatial memory | `slam.py`: heading from the agent's own turn actions (Doom's turn ramp, measured), position from the observed velocity, rays painted into an occupancy grid; the network reads a fine 32×32 ego-centric crop (free, wall, door, locked door, visited, frontier) and a zoomed-out 16×16 view |
+| Learned planner | a small conv block applied 8 times over the map (value-iteration style) so information spreads across it; all weights trained |
+| Memory | GRU (256) |
+| Heads | "which way to go" (16 directions + none), 23 button combinations conditioned on it, value, and helper heads (teacher's goal type, locked door seen) |
 
-env = make_env("maps/two_rooms.wad")     # test map; use your own maps for training
-obs, info = env.reset(seed=0)
-obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+About 1.5M parameters; about 1–4 ms per decision on one CPU thread (limit: 40 ms). Inference always
+runs on CPU.
+
+What is not learned in the submitted agent, and why it is allowed:
+- **Action masking** of `USE` and weapon-switch on the step after they were pressed (both are
+  edge-triggered; masking from the agent's own previous action).
+- **Observation preprocessing**: encoding, and the map built from observations and the agent's own actions.
+- **A safety guard**: malformed input or any internal error returns a valid action instead of crashing.
+
+## Reproduce
+
+Requires Python 3.13 and [uv](https://docs.astral.sh/uv/).
+
+```bash
+uv sync --group train                              # official env + PyTorch
+uv run python validate.py                          # official validator
+
+uv run python training/make_maps.py                # training maps + held-out maps
+uv run python training/evaluate.py --policy teacher                # score the teacher
+uv run python training/dagger.py --rounds 8 --device mps           # imitation (use --device cpu or cuda elsewhere)
+uv run python training/ppo.py --init runs/dagger/best.pt           # PPO fine-tune
+uv run python training/publish.py runs/dagger/best.pt              # copy weights into submission/
+uv run python training/watch.py                                    # watch the submitted agent
+uv run python training/watch.py --live                             # follow the newest training checkpoint
 ```
 
-Observations are a dict of `rgb`, `depth`, `vitals`, `rays` and `visible_entities`, all
-ego-centric and partially observable. See [docs/CONTRACT.md](docs/CONTRACT.md).
-The wrapper's `reward` is a basic default for convenience. Shape your own reward for training.
+## Rules compliance
 
-**Compute tip:** training only on raw pixels is expensive. The `rays`, `visible_entities` and
-`vitals` signals run thousands of steps per second on a CPU. Hybrid pixel + spatial models are welcome.
-
-## Hardware at evaluation
-
-One NVIDIA **RTX 3090 (24 GB)** shared between evaluation workers. Each agent gets **2 GB VRAM,
-8 GB RAM and 1 CPU thread**, so keep models compact and inference fast
-(see [hardware](docs/EVALUATION.md#hardware) and [timeouts](docs/EVALUATION.md#timeouts)).
-`validate.py` runs your agent under the same CPU/RAM limits and reports GPU memory.
-
-## Documentation
-
-| Doc | What's inside |
-| --- | --- |
-| [docs/CONTRACT.md](docs/CONTRACT.md) | Observation/action spaces and the `DoomAgent` interface |
-| [docs/RULES.md](docs/RULES.md) | Ground rules: what's allowed, what gets you disqualified |
-| [docs/SUBMISSION.md](docs/SUBMISSION.md) | Submission checklist, Git LFS, 1 GB limit, `requirements.txt` |
-| [docs/EVALUATION.md](docs/EVALUATION.md) | Map tiers, scoring categories, timeouts, replays |
-
-## Rules in one minute
-
-- Actions must come from **trained neural parameters**: no rule trees, no `A*`/Dijkstra, no `atan2` aimbots,
-  no unmodified off-the-shelf SB3.
-- Change anything you want **during training**. Evaluation uses the **vanilla engine**, the
-  official wrapper and **unseen maps**.
-- Create the repo during the hackathon. Libraries are fine; the core architecture and training must be yours.
+- Decisions come from trained neural parameters only. The teacher (which uses path search and aim
+  maths with privileged engine state) lives in `training/` and is never imported by `submission/`.
+- No Stable-Baselines3 or other off-the-shelf RL code: the network, DAgger and PPO are our own.
+- The agent uses only the official observation dictionary; no engine, network or disk access.
+- Training maps are generated; nothing is memorised from evaluation.
