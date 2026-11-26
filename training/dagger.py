@@ -56,7 +56,7 @@ def _collect(job) -> dict:
         wad = Path(tempfile.gettempdir()) / f"dagger_{os.getpid()}.wad"
         write_level(lvl, wad)
         env = make_env(wad, episode_ticks=lvl["ticks"])
-    buf = {k: [] for k in KEYS + ("label",)}
+    buf = {k: [] for k in KEYS + ("label", "aux")}
     try:
         obs, _ = env.reset(seed=seed)
         teacher = Teacher(rng)
@@ -76,6 +76,7 @@ def _collect(job) -> dict:
             for k in KEYS:
                 buf[k].append(np.packbits(x[k].astype(bool)) if k == "map" else x[k])
             buf["label"].append(label)
+            buf["aux"].append(teacher.aux)
             a = agent.mask((rng.random(9) < p).astype(np.int8), p) if student else label.copy()
             agent.prev, agent.t = a, agent.t + 1
             obs, _, term, trunc, _ = env.step(a)
@@ -91,7 +92,7 @@ def _collect(job) -> dict:
     np.savez_compressed(
         Path(out_dir) / f"ep_{seed:07d}.npz",
         rays=np.asarray(buf["rays"], np.float16), ent=np.asarray(buf["ent"], np.float16), ent_mask=np.asarray(buf["ent_mask"], bool),
-        body=np.asarray(buf["body"], np.float16), map=np.asarray(buf["map"], np.uint8), label=np.asarray(buf["label"], np.uint8))
+        body=np.asarray(buf["body"], np.float16), map=np.asarray(buf["map"], np.uint8), label=np.asarray(buf["label"], np.uint8), aux=np.asarray(buf["aux"], np.uint8))
     return {**score.result(), "tier": lvl["tier"], "seed": seed, "steps": t, "drift": drift}
 
 
@@ -142,7 +143,7 @@ def train(eps: list[dict], steps: int, device: str, init: Path | None, out: Path
     import torch
     import torch.nn.functional as F
 
-    from model import Policy
+    from model import MAP_CH, Policy
 
     net = Policy().to(device)
     if init is not None and init.is_file():
@@ -159,7 +160,7 @@ def train(eps: list[dict], steps: int, device: str, init: Path | None, out: Path
     t0, run = time.time(), 0.0
     for step in range(1, steps + 1):
         xb = {k: [] for k in KEYS}
-        yb, wb = [], []
+        yb, wb, ab = [], [], []
         for ei in rng.choice(len(eps), size=batch, p=probs):
             e = eps[ei]
             n = len(e["label"])
@@ -169,7 +170,7 @@ def train(eps: list[dict], steps: int, device: str, init: Path | None, out: Path
             for k in KEYS:
                 v = e[k][sl]
                 if k == "map":
-                    v = np.unpackbits(v, axis=1)[:, : 14 * 32 * 32].reshape(-1, 14, 32, 32)
+                    v = np.unpackbits(v, axis=1)[:, : MAP_CH * 32 * 32].reshape(-1, MAP_CH, 32, 32)
                 if pad:
                     v = np.concatenate([v, np.zeros((pad,) + v.shape[1:], v.dtype)])
                 xb[k].append(v)
@@ -177,17 +178,25 @@ def train(eps: list[dict], steps: int, device: str, init: Path | None, out: Path
             w = np.ones(len(y), np.float32)
             if s > 0:
                 w[:burn] = 0.0  # the GRU starts cold mid-episode: let it warm up before it is graded
+            ax = e["aux"][sl]
             if pad:
                 y = np.concatenate([y, np.zeros((pad, 9), y.dtype)])
                 w = np.concatenate([w, np.zeros(pad, np.float32)])
+                ax = np.concatenate([ax, np.zeros((pad, 2), ax.dtype)])
             yb.append(y)
             wb.append(w)
+            ab.append(ax)
         x = {k: torch.from_numpy(np.stack(v)).to(device) for k, v in xb.items()}
         x = {k: (v if k == "ent_mask" else v.float()) for k, v in x.items()}
         y = torch.from_numpy(np.stack(yb)).to(device).float()
         w = torch.from_numpy(np.stack(wb)).to(device)
         logits, _, _ = net(x)
         loss = (F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_w, reduction="none").mean(-1) * w).sum() / w.sum()
+        aux = torch.from_numpy(np.stack(ab)).to(device).long()
+        kind_logits, bearing_logits = net.last_aux
+        aux_loss = (F.cross_entropy(kind_logits.flatten(0, 1), aux[..., 0].flatten(), reduction="none")
+                    + F.cross_entropy(bearing_logits.flatten(0, 1), aux[..., 1].flatten(), reduction="none")).view_as(w)
+        loss = loss + 0.25 * (aux_loss * w).sum() / w.sum()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)

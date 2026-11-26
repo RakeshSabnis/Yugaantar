@@ -20,6 +20,7 @@ import numpy as np
 from submission.mapper import DOOR, EXIT, FREE, G, KEY, LOCKED, RES, VISITED, WALL, Mapper
 
 FWD, BACK, LEFT, RIGHT, TL, TR, ATK, USE, NEXTW = range(9)
+GOAL_ID = {"exit": 1, "key": 2, "locked": 3, "door": 4, "frontier": 5, "cover": 6}
 COVER = 3  # walking within this many cells of a free cell counts as having covered it
 N8 = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0), (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414))
 
@@ -148,6 +149,7 @@ class Teacher:
         r = np.arange(-COVER, COVER + 1)
         self.covered[((px + r) % G)[:, None], ((py + r) % G)[None, :]] = True
         a = np.zeros(9, np.int8)
+        self.aux = (0, 8)  # (goal kind, bearing bin): labels for the network's helper heads
         self.t += 1
         self.use_cd = max(0, self.use_cd - 1)
         vit = obs["vitals"]
@@ -195,6 +197,7 @@ class Teacher:
                     a[BACK] = 1  # keep melee monsters at arm's length
                 self.still = 0
                 self.replan_in = 0
+                self.aux = (7, 8)
                 return a
 
         # ---- something is attacking from outside the field of view: turn to face it
@@ -268,6 +271,11 @@ class Teacher:
         tx = (((tgt[0] - px + G // 2) % G) - G // 2 + 0.5) * RES + (math.floor(m.x / RES) * RES) - m.x
         ty = (((tgt[1] - py + G // 2) % G) - G // 2 + 0.5) * RES + (math.floor(m.y / RES) * RES) - m.y
         err = (math.atan2(ty, tx) - m.h + math.pi) % (2 * math.pi) - math.pi
+        gx, gy = self.path[-1]
+        gdx = (((gx - px + G // 2) % G) - G // 2) * RES
+        gdy = (((gy - py + G // 2) % G) - G // 2) * RES
+        rel = (math.atan2(gdy, gdx) - m.h) % (2 * math.pi)
+        self.aux = (GOAL_ID.get(self.goal_kind, 0), int(((rel + math.pi / 8) % (2 * math.pi)) // (math.pi / 4)) if (gdx or gdy) else 8)
         if abs(err) > math.radians(9):
             a[TL if err > 0 else TR] = 1
         elif abs(err) > math.radians(3):

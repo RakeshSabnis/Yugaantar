@@ -3,7 +3,9 @@
 Four encoders feed one recurrent core:
   rays      64 x (distance + hit-type one-hot)  -> circular 1D CNN (rays wrap around 360 degrees)
   entities  up to 32 x (5 features + class)      -> shared MLP + attention pooling (any number of enemies)
-  memory    2 egocentric crops of the map built by submission/mapper.py -> small 2D CNN
+  memory    2 egocentric crops of the map built by submission/mapper.py -> small 2D CNN, plus a
+            learned value-iteration planner (one small convolution applied K times, so "how far
+            is the nearest thing worth going to" can spread through free space)
   body      vitals + previous action             -> MLP
   fused -> GRU -> 9 independent button logits (+ a value head used by PPO fine-tuning)
 """
@@ -40,6 +42,36 @@ def encode(obs: dict, crops: np.ndarray, prev_action: np.ndarray) -> dict:
     return {"rays": rays, "ent": ent.astype(np.float32), "ent_mask": mask, "body": body, "map": crops}
 
 
+GOAL_KINDS = ("none", "exit", "key", "locked", "door", "frontier", "cover", "combat")  # helper-head classes
+BEARINGS = 9  # 8 compass bins relative to the agent's heading + "no target"
+
+
+class ValueIteration(nn.Module):
+    """A differentiable planner in the spirit of Value Iteration Networks (Tamar et al., 2016).
+
+    A learned reward map is computed from the memory crop; then one learned 3x3 convolution over
+    (reward, value) followed by a max over its channels is applied K times. Each application lets
+    value flow one more cell through whatever the convolution has learned to treat as passable, so
+    after K steps the values around the agent say which way the worthwhile places are. Every
+    parameter is trained; nothing here is a hand-written search."""
+
+    def __init__(self, in_ch: int, k: int = 16, q: int = 8):
+        super().__init__()
+        self.k = k
+        self.enc = nn.Sequential(nn.Conv2d(in_ch, 24, 3, padding=1), nn.ReLU(), nn.Conv2d(24, 2, 1))
+        self.q = nn.Conv2d(3, q, 3, padding=1, bias=False)
+        self.out_dim = q * 4 + 36
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rp = self.enc(x)  # reward and a second learned map (e.g. passability)
+        v = torch.zeros_like(rp[:, :1])
+        for _ in range(self.k):
+            v = self.q(torch.cat([rp, v], 1)).amax(1, keepdim=True).clamp(-20.0, 20.0)
+        qv = self.q(torch.cat([rp, v], 1))
+        c = x.shape[-1] // 2  # the agent sits at the centre of the crop
+        return torch.cat([qv[:, :, c - 1:c + 1, c - 1:c + 1].flatten(1), v[:, :, c - 3:c + 3, c - 3:c + 3].flatten(1)], 1)
+
+
 class Policy(nn.Module):
     def __init__(self, hidden: int = 256):
         super().__init__()
@@ -60,11 +92,19 @@ class Policy(nn.Module):
             nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.ReLU(),
         )
         self.map_out = nn.Linear(64 * (CROP // 8) ** 2, 192)
+        self.plan_fine = ValueIteration(NUM_LAYERS)
+        self.plan_coarse = ValueIteration(NUM_LAYERS)
+        self.plan_out = nn.Linear(2 * self.plan_fine.out_dim, 64)
         self.body = nn.Sequential(nn.Linear(BODY_FEATS, 64), nn.ReLU())
-        self.fuse = nn.Sequential(nn.Linear(128 + 96 + 192 + 64, hidden), nn.ReLU())
+        self.fuse = nn.Sequential(nn.Linear(128 + 96 + 192 + 64 + 64, hidden), nn.ReLU())
         self.gru = nn.GRU(hidden, hidden, batch_first=True)
         self.pi = nn.Linear(hidden, NUM_BUTTONS)
         self.v = nn.Linear(hidden, 1)
+        # Helper heads, used only as extra training signal: what is the teacher heading for, and in
+        # which direction? They force the memory and the planner to carry task-relevant facts.
+        self.aux_kind = nn.Linear(hidden, len(GOAL_KINDS))
+        self.aux_bearing = nn.Linear(hidden, BEARINGS)
+        self.last_aux = None
 
     def features(self, x: dict) -> torch.Tensor:
         """x: tensors shaped (N, ...). Returns (N, hidden)."""
@@ -77,12 +117,15 @@ class Policy(nn.Module):
         pooled = torch.einsum("nqk,nkd->nqd", att * any_ent, e).flatten(1)
         e = F.relu(self.ent_out(pooled))
         m = F.relu(self.map_out(self.map(x["map"]).flatten(1)))
+        pl = F.relu(self.plan_out(torch.cat([self.plan_fine(x["map"][:, :NUM_LAYERS]), self.plan_coarse(x["map"][:, NUM_LAYERS:])], 1)))
         b = self.body(x["body"])
-        return self.fuse(torch.cat([r, e, m, b], 1))
+        return self.fuse(torch.cat([r, e, m, pl, b], 1))
 
     def forward(self, x: dict, h: torch.Tensor | None = None):
         """x: tensors shaped (B, T, ...). Returns logits (B, T, 9), value (B, T), hidden (1, B, H)."""
         B, T = x["body"].shape[:2]
         z = self.features({k: v.flatten(0, 1) for k, v in x.items()}).view(B, T, -1)
         out, h = self.gru(z, h)
+        if self.training:
+            self.last_aux = (self.aux_kind(out), self.aux_bearing(out))
         return self.pi(out), self.v(out).squeeze(-1), h
