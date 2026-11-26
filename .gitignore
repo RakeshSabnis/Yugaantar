@@ -150,7 +150,7 @@ activemq-data/
 .envrc
 .venv
 venv/
-ENV/
+# (ENV/ removed: on case-insensitive filesystems it also ignored env/, the official wrapper)
 env.bak/
 venv.bak/
 
@@ -222,3 +222,8 @@ _vizdoom.ini
 
 # Local validator / scorer artifacts
 *.lmp
+
+# OS / local training artifacts
+.DS_Store
+/runs/
+/data/

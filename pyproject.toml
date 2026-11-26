@@ -13,6 +13,8 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8"]
+# Training-only extras (the evaluation image already ships torch/scipy; see docker/requirements.lock)
+train = ["torch", "scipy"]
 
 [tool.uv.sources]
 doom-env = { path = "env", editable = true }
