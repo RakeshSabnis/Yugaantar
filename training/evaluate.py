@@ -33,7 +33,7 @@ def run_one(args) -> dict:
     from scorer import Tracker
     from submission.actions import to_buttons
 
-    env = make_env(item["path"], "MAP01", episode_ticks=item["ticks"], render_buffers=False)
+    env = make_env(item["path"], item.get("map", "MAP01"), episode_ticks=item["ticks"], render_buffers=False)
     obs, _ = env.reset(seed=seed)
     tracker = Tracker(env.privileged_state())
     grid = Path(item["path"]).with_suffix(".txt").read_text() if Path(item["path"]).with_suffix(".txt").exists() else None
@@ -69,7 +69,7 @@ def run_one(args) -> dict:
         tracker.update(env.privileged_state())
         if term or trunc:
             break
-    res = tracker.result(Path(item["path"]).name, item["tier"], crashed).as_dict()
+    res = tracker.result(Path(item["path"]).name + ":" + item.get("map", "MAP01"), item["tier"], crashed).as_dict()
     res["seconds"] = time.perf_counter() - t0
     env.close()
     return res
