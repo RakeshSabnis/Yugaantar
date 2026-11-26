@@ -24,6 +24,7 @@ from mapgen import CELL, KEY_FOR_LOCK, LOCKS  # noqa: E402
 KEY_VITAL = {"r": 10, "b": 8, "y": 9}  # vitals index of the card flag (red, blue, yellow)
 ENEMY_TYPES = (1, 2, 3)
 FIRE_WHILE_ALIGNING = __import__("os").environ.get("TEACHER_FIRE_ALIGN", "0") == "1"
+TAP_FIRE = __import__("os").environ.get("TEACHER_TAP", "0") == "1"
 
 
 def _wrap(a: float) -> float:
@@ -223,6 +224,9 @@ class Teacher:
         if abs(rel) > tol:
             return 14 if rel > 0 else 15  # nearly on target: shoot while side-stepping into line
         if dist > 150 and et[i] != 1:
+            if TAP_FIRE and dist > 300 and ATK in COMBOS[self.prev_action]:
+                # holding fire makes Doom spread the shots: at range, release for a step between shots
+                return 7 if self.strafe_dir > 0 else 8
             return 14 if self.strafe_dir > 0 else 15  # on target: shoot and dodge
         return 11
 
