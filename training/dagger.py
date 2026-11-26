@@ -39,7 +39,8 @@ def _collect(job) -> dict:
 
     from doom_env import make_env
     from doom_env.spaces import action_space, observation_space
-    from training.mapgen import make_level, write_level
+    from training.mapgen import write_level
+    from training.play import level_for
     from training.scorer import EpisodeScore
     from training.teacher import Teacher
 
@@ -48,10 +49,13 @@ def _collect(job) -> dict:
         _AGENT = DoomAgent(observation_space(), action_space(), "cpu")
     agent = _AGENT
     rng = np.random.default_rng([seed, 77])
-    lvl = make_level(seed)
-    wad = Path(tempfile.gettempdir()) / f"dagger_{os.getpid()}.wad"
-    write_level(lvl, wad)
-    env = make_env(wad, episode_ticks=lvl["ticks"])
+    lvl = level_for(seed)
+    if "wad" in lvl:
+        env = make_env(lvl["wad"], lvl["map"], episode_ticks=lvl["ticks"])
+    else:
+        wad = Path(tempfile.gettempdir()) / f"dagger_{os.getpid()}.wad"
+        write_level(lvl, wad)
+        env = make_env(wad, episode_ticks=lvl["ticks"])
     buf = {k: [] for k in KEYS + ("label",)}
     try:
         obs, _ = env.reset(seed=seed)
@@ -59,7 +63,7 @@ def _collect(job) -> dict:
         teacher.reset(env)
         agent.reset()
         agent.rng = rng
-        score = EpisodeScore(lvl["monsters"], max(1, lvl["floor_cells"] * lvl["cell"] ** 2 // 128**2))
+        score = EpisodeScore() if "wad" in lvl else EpisodeScore(lvl["monsters"], max(1, lvl["floor_cells"] * lvl["cell"] ** 2 // 128**2))
         score.update(env.privileged_state())
         student = False
         t = 0

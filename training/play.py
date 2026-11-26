@@ -19,16 +19,33 @@ from training.mapgen import make_level, write_level
 from training.scorer import TIER_WEIGHT, EpisodeScore
 
 HELD_OUT = 1_000_000  # seeds >= this are never used for training
+REAL_EVERY = 5  # every 5th training seed is a hand-made Freedoom level instead of a generated one
+
+
+def real_level(seed: int) -> dict:
+    """A hand-made Freedoom 2 level (MAP01-MAP32, bundled with ViZDoom): diagonal walls, stairs,
+    odd room shapes. Nothing like our grid generator, which is the point: the agent must not depend
+    on one map style. Reported as "tier 5" and not counted in the tier-weighted score."""
+    import vizdoom
+    return {"wad": os.path.join(os.path.dirname(vizdoom.__file__), "freedoom2.wad"), "map": f"MAP{seed // REAL_EVERY % 32 + 1:02d}",
+            "ticks": 4200, "tier": 5, "seed": seed, "monsters": None}
+
+
+def level_for(seed: int, real: bool = True) -> dict:
+    return real_level(seed) if real and seed % REAL_EVERY == REAL_EVERY - 1 else make_level(seed)
 
 
 def run_episode(lvl: dict, policy, wad_dir: str | None = None, on_step=None) -> dict:
     """policy: object with reset(env) and act(obs, env) -> action."""
-    wad = Path(wad_dir or tempfile.gettempdir()) / f"lvl_{os.getpid()}.wad"
-    write_level(lvl, wad)
-    env = make_env(wad, episode_ticks=lvl["ticks"])  # frames are needed for the exit cue
+    if "wad" in lvl:
+        env = make_env(lvl["wad"], lvl["map"], episode_ticks=lvl["ticks"])
+    else:
+        wad = Path(wad_dir or tempfile.gettempdir()) / f"lvl_{os.getpid()}.wad"
+        write_level(lvl, wad)
+        env = make_env(wad, episode_ticks=lvl["ticks"])  # frames are needed for the exit cue
     try:
         obs, _ = env.reset(seed=lvl["seed"])
-        score = EpisodeScore(lvl["monsters"], max(1, lvl["floor_cells"] * lvl["cell"] ** 2 // 128 ** 2))
+        score = EpisodeScore() if "wad" in lvl else EpisodeScore(lvl["monsters"], max(1, lvl["floor_cells"] * lvl["cell"] ** 2 // 128 ** 2))
         score.update(env.privileged_state())
         policy.reset(env)
         while True:
@@ -97,7 +114,7 @@ def summarize(rows: list[dict]) -> str:
     for tier in sorted({r["tier"] for r in rows}):
         rs = [r for r in rows if r["tier"] == tier]
         mean = lambda k: float(np.mean([r[k] for r in rs]))
-        total += TIER_WEIGHT[tier] * mean("score")
+        total += TIER_WEIGHT.get(tier, 0.0) * mean("score")
         out.append(f"tier {tier}: n={len(rs):3d} score {mean('score'):6.1f}  exit {mean('exit'):.2f}  dead {mean('dead'):.2f}  "
                    f"keys {mean('keys'):.2f}  doors {mean('doors'):.2f}  locked {mean('locked'):.2f}  explore {mean('explore'):.2f}  kills {mean('kills'):.1f}")
     out.append(f"tier-weighted score: {total:.1f}")
