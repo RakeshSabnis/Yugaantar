@@ -38,7 +38,8 @@ def collect_episode(args) -> dict:
     from doom_env import make_env
 
     from actions import NEXTW_ACTIONS, NUM_ACTIONS, USE_ACTIONS, to_buttons
-    from model import Policy, encode_obs
+    from model import Perception, Policy
+    from model import OBS_DIM
     from scorer import Tracker
     from teacher import Teacher, door_open_fn
 
@@ -55,14 +56,15 @@ def collect_episode(args) -> dict:
         model.eval()
         h = model.initial_state(1)
     tracker = Tracker(env.privileged_state())
-    X, PA, Y, G, L = [], [], [], [], []
+    perception = Perception()
+    X, M, PA, Y, G, L = [], [], [], [], [], []
     prev, locked_seen = 0, 0
     while True:
         priv = env.privileged_state()
         label = teacher.act(obs, priv, door_open)
-        x = encode_obs(obs)
+        x = perception.see(obs)
         locked_seen = int(locked_seen or bool(np.any(obs["rays"]["hit_type"] == 3)))
-        X.append(x.astype(np.float16)); PA.append(prev); Y.append(label); G.append(GOAL_ID.get(teacher.goal_kind, 0)); L.append(locked_seen)
+        X.append(x[:OBS_DIM].astype(np.float16)); M.append(x[OBS_DIM:].astype(np.uint8)); PA.append(prev); Y.append(label); G.append(GOAL_ID.get(teacher.goal_kind, 0)); L.append(locked_seen)
         a = label
         if model is not None:
             logits, _, h = model.step(torch.from_numpy(x).unsqueeze(0), torch.tensor([prev]), h)
@@ -78,14 +80,16 @@ def collect_episode(args) -> dict:
         # keep the teacher's own memory of its last action consistent with what was executed
         teacher.prev_action = a
         teacher.prev_use = a in USE_ACTIONS
-        obs, r, term, trunc, info = env.step(to_buttons(a))
+        buttons = to_buttons(a)
+        perception.did(buttons)
+        obs, r, term, trunc, info = env.step(buttons)
         tracker.update(env.privileged_state())
         prev = a
         if term or trunc:
             break
     env.close()
     res = tracker.result(Path(item["path"]).name, item["tier"]).as_dict()
-    return {"x": np.stack(X), "pa": np.array(PA, np.int16), "y": np.array(Y, np.int16), "g": np.array(G, np.int8),
+    return {"x": np.stack(X), "m": np.stack(M), "pa": np.array(PA, np.int16), "y": np.array(Y, np.int16), "g": np.array(G, np.int8),
             "l": np.array(L, np.int8), "result": res}
 
 
@@ -111,7 +115,7 @@ def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=prin
             eps = [episodes[i] for i in order[b0:b0 + batch]]
             T = max(len(e["y"]) for e in eps)
             B = len(eps)
-            x = np.zeros((B, T, eps[0]["x"].shape[1]), np.float32)
+            x = np.zeros((B, T, eps[0]["x"].shape[1] + eps[0]["m"].shape[1]), np.float32)
             pa = np.zeros((B, T), np.int64)
             y = np.zeros((B, T), np.int64)
             g = np.zeros((B, T), np.int64)
@@ -119,7 +123,7 @@ def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=prin
             m = np.zeros((B, T), np.float32)
             for i, e in enumerate(eps):
                 k = len(e["y"])
-                x[i, :k] = e["x"]; pa[i, :k] = e["pa"]; y[i, :k] = e["y"]; g[i, :k] = e["g"]; lk[i, :k] = e["l"]; m[i, :k] = 1
+                x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; y[i, :k] = e["y"]; g[i, :k] = e["g"]; lk[i, :k] = e["l"]; m[i, :k] = 1
             x, pa, y, g, lk, m = (torch.from_numpy(a).to(device) for a in (x, pa, y, g, lk, m))
             h = model.initial_state(B, device)
             for t0c in range(0, T, chunk):
@@ -155,6 +159,8 @@ def main():
     ap.add_argument("--max-pool", type=int, default=2500, help="max episodes kept in the aggregated dataset")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--resume", default=None)
+    ap.add_argument("--resume-beta", type=float, default=0.25, help="teacher mix per step when resuming")
+    ap.add_argument("--lr", type=float, default=3e-4)
     a = ap.parse_args()
 
     import torch
@@ -174,13 +180,17 @@ def main():
     items = json.loads((Path(a.maps) / "index.json").read_text())
     model = Policy().to(a.device)
     if a.resume:
-        model.load_state_dict(torch.load(a.resume, map_location=a.device, weights_only=True)["model"])
+        from model import load_compatible
+
+        log(f"resume from {a.resume}; adapted layers: {load_compatible(model, torch.load(a.resume, map_location=a.device, weights_only=True)['model'])}")
+    if a.resume:  # so round 0 already lets the resumed network play (not just the teacher)
+        torch.save({"model": model.state_dict()}, out / "last.pt")
     pool: list[dict] = []
     best = -1e9
-    betas = [1.0, 0.5, 0.25, 0.1, 0.0, 0.0, 0.0, 0.0]
+    betas = [1.0, 0.5, 0.3, 0.2, 0.2, 0.2, 0.2, 0.2]
     rng = np.random.default_rng(0)
     for rnd in range(a.rounds):
-        beta = betas[min(rnd, len(betas) - 1)] if not a.resume else max(0.0, 0.25 - 0.1 * rnd)
+        beta = betas[min(rnd, len(betas) - 1)] if not a.resume else a.resume_beta
         weights = str(out / "last.pt") if (out / "last.pt").exists() else None
         chosen = [items[i] for i in rng.choice(len(items), size=min(a.episodes, len(items)), replace=False)]
         t0 = time.time()
@@ -193,7 +203,7 @@ def main():
         pool += eps
         if len(pool) > a.max_pool:
             pool = pool[-a.max_pool:]
-        train(model, pool, a.epochs, a.device, log=log)
+        train(model, pool, a.epochs, a.device, lr=a.lr, log=log)
         torch.save({"model": model.state_dict()}, out / "last.pt")
         summary, _ = evaluate(a.heldout, "agent", str(out / "last.pt"), a.workers)
         log(f"round {rnd} held-out: weighted {summary['weighted']:.1f} " + " ".join(f"t{k}: score {summary[f't{k}']['score']:.1f} exit {summary[f't{k}']['exit']:.2f} dead {summary[f't{k}']['dead']:.2f}" for k in (1, 2, 3, 4) if f"t{k}" in summary))

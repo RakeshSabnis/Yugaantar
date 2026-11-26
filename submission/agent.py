@@ -20,9 +20,10 @@ sys.path.insert(0, str(SUBMISSION_DIR))
 import torch  # noqa: E402
 
 from actions import NEXTW_ACTIONS, NUM_ACTIONS, USE_ACTIONS, to_buttons  # noqa: E402
-from model import Policy, encode_obs  # noqa: E402
+from model import Perception, Policy, load_compatible  # noqa: E402
 
-TEMPERATURE = 0.5  # low-temperature sampling: mostly the best action, enough noise to escape loops
+TEMPERATURE = float(__import__("os").environ.get("DOOM_TEMPERATURE", "0.5"))  # low-temperature sampling: mostly the best action, enough noise to escape loops
+COMBAT_TEMPERATURE = float(__import__("os").environ.get("DOOM_COMBAT_TEMPERATURE", "0.3"))
 
 
 class DoomAgent:
@@ -38,10 +39,11 @@ class DoomAgent:
         self.loaded = False
         if path.is_file():
             state = torch.load(path, map_location="cpu", weights_only=True)
-            self.model.load_state_dict(state["model"] if "model" in state else state)
+            load_compatible(self.model, state["model"] if "model" in state else state)
             self.loaded = True
         self.model.eval()
         self.rng = np.random.default_rng(0)
+        self.perception = Perception()
         self.reset()
         # Warm-up so the first act() of a map is fast.
         dummy = {
@@ -58,10 +60,11 @@ class DoomAgent:
         self.h = self.model.initial_state(1)
         self.prev_action = 0
         self.rng = np.random.default_rng(0)
+        self.perception.reset()
 
     def act(self, observation: dict) -> np.ndarray:
         try:
-            x = torch.from_numpy(encode_obs(observation)).unsqueeze(0)
+            x = torch.from_numpy(self.perception.see(observation)).unsqueeze(0)
             logits, _, self.h = self.model.step(x, torch.tensor([self.prev_action]), self.h)
             logits = logits[0].double().numpy()
             if self.prev_action in USE_ACTIONS:
@@ -70,13 +73,21 @@ class DoomAgent:
                 logits[list(NEXTW_ACTIONS)] = -np.inf
             if not np.all(np.isfinite(logits[np.isfinite(logits)])) or not np.isfinite(logits).any():
                 raise ValueError("bad logits")
-            z = (logits - logits[np.isfinite(logits)].max()) / TEMPERATURE
+            # Sharper sampling while an enemy is in view (precise aiming/dodging), broader otherwise
+            # (exploration). This only scales the network's own distribution; it never picks an action.
+            ents = observation["visible_entities"]
+            enemy = bool(np.any((np.asarray(ents["mask"]) > 0) & np.isin(np.asarray(ents["entity_type"]), (1, 2, 3))))
+            temp = COMBAT_TEMPERATURE if enemy else TEMPERATURE
+            z = (logits - logits[np.isfinite(logits)].max()) / temp
             p = np.exp(z)
             p /= p.sum()
             a = int(self.rng.choice(NUM_ACTIONS, p=p))
             self.prev_action = a
-            return to_buttons(a)
+            buttons = to_buttons(a)
+            self.perception.did(buttons)
+            return buttons
         except Exception:  # never crash: a crash freezes the player for the rest of the map
             self.prev_action = 1
             self.h = self.model.initial_state(1)
+            self.perception.did(to_buttons(1))
             return to_buttons(1)  # move forward

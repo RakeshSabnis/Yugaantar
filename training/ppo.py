@@ -41,7 +41,7 @@ def rollout(args) -> dict:
     from doom_env import make_env
 
     from actions import NEXTW_ACTIONS, NUM_ACTIONS, USE_ACTIONS, to_buttons
-    from model import Policy, encode_obs
+    from model import OBS_DIM, Perception, Policy
     from scorer import AREA, Tracker
     from teacher import Teacher, door_open_fn
 
@@ -59,11 +59,12 @@ def rollout(args) -> dict:
     tracker = Tracker(p0)
     areas = {(math.floor(p0["x"] / AREA), math.floor(p0["y"] / AREA))}
     last = {"keys": 0, "doors": 0, "locks": 0, "kills": 0, "damage": 0.0}
-    X, PA, A, LP, R, Y = [], [], [], [], [], []
+    X, M, PA, A, LP, R, Y = [], [], [], [], [], [], []
+    perception = Perception()
     prev = 0
     while True:
         label = teacher.act(obs, env.privileged_state(), door_open)
-        x = encode_obs(obs)
+        x = perception.see(obs)
         logits, _, h = model.step(torch.from_numpy(x).unsqueeze(0), torch.tensor([prev]), h)
         lg = logits[0].double().numpy()
         if prev in USE_ACTIONS:
@@ -73,9 +74,11 @@ def rollout(args) -> dict:
         z = (lg - lg.max()) / temperature
         p = np.exp(z); p /= p.sum()
         a = int(rng.choice(NUM_ACTIONS, p=p))
-        X.append(x.astype(np.float16)); PA.append(prev); A.append(a); LP.append(math.log(max(p[a], 1e-12))); Y.append(label)
+        X.append(x[:OBS_DIM].astype(np.float16)); M.append(x[OBS_DIM:].astype(np.uint8)); PA.append(prev); A.append(a); LP.append(math.log(max(p[a], 1e-12))); Y.append(label)
         teacher.prev_action, teacher.prev_use = a, a in USE_ACTIONS
-        obs, _, term, trunc, info = env.step(to_buttons(a))
+        buttons = to_buttons(a)
+        perception.did(buttons)
+        obs, _, term, trunc, info = env.step(buttons)
         pr = env.privileged_state()
         tracker.update(pr)
         res = tracker.result("", item["tier"])
@@ -97,7 +100,7 @@ def rollout(args) -> dict:
             break
     env.close()
     out = tracker.result(Path(item["path"]).name, item["tier"]).as_dict()
-    return {"x": np.stack(X), "pa": np.array(PA, np.int16), "a": np.array(A, np.int16), "lp": np.array(LP, np.float32),
+    return {"x": np.stack(X), "m": np.stack(M), "pa": np.array(PA, np.int16), "a": np.array(A, np.int16), "lp": np.array(LP, np.float32),
             "r": np.array(R, np.float32), "y": np.array(Y, np.int16), "truncated": bool(trunc and not term), "result": out}
 
 
@@ -131,6 +134,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--eval-every", type=int, default=10)
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--value-warmup", type=int, default=15, help="iterations where value gradients don't reach the shared layers")
     a = ap.parse_args()
 
     import torch
@@ -151,7 +155,10 @@ def main():
         logf.write(s + "\n"); logf.flush()
 
     model = Policy().to(dev)
-    model.load_state_dict(torch.load(a.init, map_location=dev, weights_only=True)["model"])
+    from model import load_compatible
+
+    load_compatible(model, torch.load(a.init, map_location=dev, weights_only=True)["model"])
+    model.detach_value = True
     torch.save({"model": model.state_dict()}, out / "last.pt")
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
     items = json.loads((Path(a.maps) / "index.json").read_text())
@@ -170,6 +177,7 @@ def main():
     ret_rms = 1.0
     for it in range(1, a.iters + 1):
         t0 = time.time()
+        model.detach_value = it <= a.value_warmup
         chosen = [items[i] for i in rng.choice(len(items), size=a.episodes, replace=False)]
         eps = pool.map(rollout, [(c, str(out / "last.pt"), int(rng.integers(1 << 30)), a.temperature) for c in chosen], chunksize=1)
         t_col = time.time() - t0
@@ -177,12 +185,12 @@ def main():
         # ---- batch episodes, compute values and GAE
         B = len(eps)
         T = max(len(e["a"]) for e in eps)
-        D = eps[0]["x"].shape[1]
+        D = eps[0]["x"].shape[1] + eps[0]["m"].shape[1]
         x = np.zeros((B, T, D), np.float32); pa = np.zeros((B, T), np.int64); act = np.zeros((B, T), np.int64)
         lp_old = np.zeros((B, T), np.float32); rew = np.zeros((B, T), np.float32); y = np.zeros((B, T), np.int64); m = np.zeros((B, T), np.float32)
         for i, e in enumerate(eps):
             k = len(e["a"])
-            x[i, :k] = e["x"]; pa[i, :k] = e["pa"]; act[i, :k] = e["a"]; lp_old[i, :k] = e["lp"]; rew[i, :k] = e["r"]; y[i, :k] = e["y"]; m[i, :k] = 1
+            x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; act[i, :k] = e["a"]; lp_old[i, :k] = e["lp"]; rew[i, :k] = e["r"]; y[i, :k] = e["y"]; m[i, :k] = 1
         tx, tpa, tact, tlp, ty, tm = (torch.from_numpy(v).to(dev) for v in (x, pa, act, lp_old, y, m))
         with torch.no_grad():
             _, values, _, _ = model(tx, tpa, model.initial_state(B, dev))
@@ -212,6 +220,8 @@ def main():
             for idx in np.array_split(rng.permutation(B), max(1, B // 14)):
                 idx_t = torch.from_numpy(idx).to(dev)
                 h = model.initial_state(len(idx), dev)
+                opt.zero_grad()
+                n_tot = float(tm[idx_t].sum())
                 for c0 in range(0, T, 64):
                     sl = slice(c0, c0 + 64)
                     mm = tm[idx_t, sl]
@@ -228,16 +238,19 @@ def main():
                     vl = (v - tret[idx_t, sl]) ** 2
                     ent = -(logp_all.exp() * logp_all).sum(-1)
                     bcl = Fn.cross_entropy(logits.reshape(-1, logits.shape[-1]), ty[idx_t, sl].reshape(-1), reduction="none").view_as(lp)
-                    loss = ((pl + 0.5 * vl - a.ent * ent + bc * bcl) * mm).sum() / mm.sum()
-                    opt.zero_grad()
+                    # one optimizer step per minibatch: accumulate gradients over all chunks
+                    # warm-up: learn the value function only, leave the policy untouched
+                    pw = 0.0 if it <= a.value_warmup else 1.0
+                    loss = ((pw * (pl - a.ent * ent + bc * bcl) + 0.5 * vl) * mm).sum() / n_tot
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    opt.step()
-                    stats.append([float((pl * mm).sum() / mm.sum()), float((vl * mm).sum() / mm.sum()), float((ent * mm).sum() / mm.sum()),
-                                  float((bcl * mm).sum() / mm.sum()), float((((ratio - 1).abs() > a.clip).float() * mm).sum() / mm.sum())])
+                    stats.append([float((pl.detach() * mm).sum() / mm.sum()), float((vl.detach() * mm).sum() / mm.sum()), float((ent.detach() * mm).sum() / mm.sum()),
+                                  float((bcl.detach() * mm).sum() / mm.sum()), float((((ratio.detach() - 1).abs() > a.clip).float() * mm).sum() / mm.sum())])
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                opt.step()
         model.eval()
         torch.save({"model": model.state_dict()}, out / "last.pt")
-        bc *= a.bc_decay
+        if it > a.value_warmup:
+            bc *= a.bc_decay
         s = np.mean(stats, 0)
         res = [e["result"] for e in eps]
         log(f"it {it}: exit {np.mean([r['exit'] for r in res]):.2f} dead {np.mean([r['dead'] for r in res]):.2f} "

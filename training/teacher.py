@@ -156,7 +156,34 @@ class Teacher:
             return int(self.rng.choice([4, 5, 1]))
         return self._follow(path, x, y, ang, keys, door_open, obs)
 
+    def _dodge(self, obs) -> int | None:
+        """Incoming projectile (imp fireball etc.) on a collision course: sidestep it, keep shooting."""
+        ents = obs["visible_entities"]
+        for k in range(len(ents["mask"])):
+            if not ents["mask"][k] or ents["entity_type"][k] != 4:
+                continue
+            d, s, c, vf, vr = (float(v) for v in ents["features"][k])
+            dist = d * 1024
+            if dist > 600:
+                continue
+            px, py = c * dist, s * dist          # position: forward, left
+            vx, vy = vf, -vr                     # relative velocity: forward, left
+            closing = -(px * vx + py * vy) / max(dist, 1.0)
+            if closing < 2.0:
+                continue
+            # closest approach of its straight-line path to us
+            miss = abs(px * vy - py * vx) / max(math.hypot(vx, vy), 1e-6)
+            if miss > 48:
+                continue
+            # step to the side away from the projectile's path; strafe left = +y
+            side_left = (px * vy - py * vx) < 0
+            return 14 if side_left else 15  # attack + strafe
+        return None
+
     def _combat(self, obs) -> int | None:
+        dodge = self._dodge(obs)
+        if dodge is not None:
+            return dodge
         ents = obs["visible_entities"]
         best = None
         for k in range(len(ents["mask"])):
