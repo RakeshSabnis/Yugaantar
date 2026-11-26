@@ -144,8 +144,8 @@ never opened a lock, and it kept returning to doors it could not open. That prod
 <li><b>Our scorer is an estimate</b> of the official one, and scores move by about ±40 between seed sets, so we only trust differences that hold on two seed sets and on maps from a second generator.</li>
 <li><b>Map-style risk:</b> if hidden maps are not grid-style, the map memory is less precise. On 80 maps with other cell sizes and random start directions the agent held its score.</li>
 </ul>
-<p class="small"><b>With more time:</b> longer RL with a properly trained value function, a learned (network-based) curiosity signal
-alongside the map-based one, and training on community WADs. Code, training logs of what worked and what did
+<p class="small"><b>With more time:</b> longer runs to get the actor-critic term and the learned curiosity module into the weights,
+and training on community WADs. Code, training logs of what worked and what did
 not, and the failure-analysis tool are in the repository (<code>training/</code>, <code>team/WORKLOG.md</code>).</p>
 </div>
 
