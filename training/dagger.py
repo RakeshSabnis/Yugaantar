@@ -28,7 +28,7 @@ import numpy as np  # noqa: E402
 GOAL_ID = {"": 0, "exit": 1, "key": 2, "frontier": 3, "revisit": 4}
 # Reward for the RL term (self-imitation). Scoring-shaped terms use privileged state in training only;
 # "curiosity" is intrinsic: a new cell in the agent's own SLAM map.
-REWARD = {"exit": 10.0, "key": 3.0, "door": 0.5, "lock": 3.0, "curiosity": 0.05, "kill": 0.5, "damage": 0.01, "death": 5.0, "step": 0.002}
+REWARD = {"exit": 10.0, "key": 3.0, "door": 0.5, "lock": 3.0, "curiosity": 0.05, "kill": 0.5, "damage": 0.01, "death": 5.0, "step": 0.002, "rnd": 0.005}
 GAMMA = 0.995
 RET_SCALE = 5.0
 
@@ -72,7 +72,7 @@ def collect_episode(args) -> dict:
         h = model.initial_state(1)
     tracker = Tracker(env.privileged_state())
     perception = Perception()
-    X, M, PA, Y, G, L, D, A, R = [], [], [], [], [], [], [], [], []
+    X, M, PA, Y, G, L, D, A, R, OWN = [], [], [], [], [], [], [], [], [], []
     last = {"keys": 0, "doors": 0, "locks": 0, "kills": 0, "damage": 0.0}
     seen_cells: set = set()
     prev, locked_seen = 0, 0
@@ -83,6 +83,7 @@ def collect_episode(args) -> dict:
         locked_seen = int(locked_seen or bool(np.any(obs["rays"]["hit_type"] == 3)))
         X.append(x[:OBS_DIM].astype(np.float16)); M.append(x[OBS_DIM:].astype(np.uint8)); PA.append(prev); Y.append(label); G.append(GOAL_ID.get(teacher.goal_kind, 0)); L.append(locked_seen); D.append(dir_bin(teacher.dir_rel))
         a = label
+        own = 0
         if model is not None:
             logits, _, h = model.step(torch.from_numpy(x).unsqueeze(0), torch.tensor([prev]), h)
             if rng.random() >= beta:
@@ -94,6 +95,8 @@ def collect_episode(args) -> dict:
                 z = (lg - lg.max()) / temperature
                 p = np.exp(z); p /= p.sum()
                 a = int(rng.choice(NUM_ACTIONS, p=p))
+                own = 1
+        OWN.append(own)
         # keep the teacher's own memory of its last action consistent with what was executed
         teacher.prev_action = a
         teacher.prev_use = a in USE_ACTIONS
@@ -123,9 +126,19 @@ def collect_episode(args) -> dict:
         if term or trunc:
             break
     env.close()
+    # learned curiosity (random network distillation, training/rnd.py): novelty of each state reached
+    rnd_path = Path(weights).with_name("rnd.pt") if weights else None
+    if rnd_path is not None and rnd_path.exists():
+        from rnd import RND
+
+        rnd = RND()
+        rnd.load_state_dict(torch.load(rnd_path, map_location="cpu", weights_only=True))
+        xs = np.concatenate([np.stack(X).astype(np.float32), np.stack(M).astype(np.float32)], axis=1)
+        nov = rnd.novelty(torch.from_numpy(xs)).numpy()
+        R = [r_ + REWARD["rnd"] * float(n_) for r_, n_ in zip(R, nov[1:].tolist() + [0.0])]
     final = tracker.result(Path(item["path"]).name, item["tier"]).as_dict()
     return {"x": np.stack(X), "m": np.stack(M), "pa": np.array(PA, np.int16), "y": np.array(Y, np.int16), "g": np.array(G, np.int8),
-            "l": np.array(L, np.int8), "d": np.array(D, np.int8), "a": np.array(A, np.int16), "ret": discounted(R), "result": final}
+            "l": np.array(L, np.int8), "d": np.array(D, np.int8), "a": np.array(A, np.int16), "own": np.array(OWN, np.int8), "ret": discounted(R), "result": final}
 
 
 def collect(items, weights, beta, workers, seed0, temperature=0.5):
@@ -136,7 +149,7 @@ def collect(items, weights, beta, workers, seed0, temperature=0.5):
 
 
 # --------------------------------------------------------------------------------------- training
-def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=print, sil=0.0):
+def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=print, sil=0.0, pg=0.0, fresh_round=-1):
     import torch
     import torch.nn.functional as Fn
 
@@ -158,12 +171,13 @@ def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=prin
             dd = np.zeros((B, T), np.int64)
             aa = np.zeros((B, T), np.int64)
             gg = np.zeros((B, T), np.float32)
+            fr = np.zeros((B, T), np.float32)  # 1 where the network itself chose the action, in this round's games
             lk = np.zeros((B, T), np.float32)
             m = np.zeros((B, T), np.float32)
             for i, e in enumerate(eps):
                 k = len(e["y"])
-                x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; y[i, :k] = e["y"]; g[i, :k] = e["g"]; dd[i, :k] = e["d"]; aa[i, :k] = e["a"]; gg[i, :k] = e["ret"]; lk[i, :k] = e["l"]; m[i, :k] = 1
-            x, pa, y, g, dd, lk, m, aa, gg = (torch.from_numpy(a).to(device) for a in (x, pa, y, g, dd, lk, m, aa, gg))
+                x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; y[i, :k] = e["y"]; g[i, :k] = e["g"]; dd[i, :k] = e["d"]; aa[i, :k] = e["a"]; gg[i, :k] = e["ret"]; fr[i, :k] = e["own"] * float(e.get("round", -2) == fresh_round); lk[i, :k] = e["l"]; m[i, :k] = 1
+            x, pa, y, g, dd, lk, m, aa, gg, fr = (torch.from_numpy(a).to(device) for a in (x, pa, y, g, dd, lk, m, aa, gg, fr))
             h = model.initial_state(B, device)
             for t0c in range(0, T, chunk):
                 sl = slice(t0c, t0c + chunk)
@@ -185,7 +199,11 @@ def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=prin
                 adv = (ret - val.detach()).clamp(0.0, 2.0)
                 logp_a = torch.log_softmax(logits, -1).gather(-1, aa[:, sl].unsqueeze(-1)).squeeze(-1)
                 sil_loss = -(adv * logp_a)
-                rl = (0.5 * vloss + sil * sil_loss).reshape(-1)
+                # ---- actor-critic policy gradient on the newest, on-policy games: the signed advantage
+                # reinforces better-than-expected actions and discourages worse-than-expected ones.
+                adv_full = (ret - val.detach()).clamp(-2.0, 2.0)
+                pg_loss = -(adv_full * logp_a) * fr[:, sl]
+                rl = (0.5 * vloss + sil * sil_loss + pg * pg_loss).reshape(-1)
                 loss = ((ce + 0.2 * ceg + 0.2 * bce + 0.5 * ced + rl) * mf).sum() / mf.sum()
                 vsum += float((vloss.reshape(-1) * mf).sum().detach()); ssum += float((adv.reshape(-1) * mf).sum())
                 dcorrect += float(((ad.argmax(-1) == dd[:, sl]).float() * mm).sum())
@@ -212,6 +230,7 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--tier-weights", type=float, nargs=4, default=[1, 1, 1, 1],
                     help="relative sampling weight of tier 1..4 maps when choosing each round's games")
+    ap.add_argument("--pg", type=float, default=0.1, help="weight of the actor-critic policy-gradient term on the newest games")
     ap.add_argument("--sil", type=float, default=0.3, help="weight of the self-imitation (RL) term; 0 = pure imitation")
     ap.add_argument("--resume", default=None)
     ap.add_argument("--resume-beta", type=float, default=0.25, help="teacher mix per step when resuming")
@@ -240,6 +259,10 @@ def main():
         log(f"resume from {a.resume}; adapted layers: {load_compatible(model, torch.load(a.resume, map_location=a.device, weights_only=True)['model'])}")
     if a.resume:  # so round 0 already lets the resumed network play (not just the teacher)
         torch.save({"model": model.state_dict()}, out / "last.pt")
+    from rnd import RND
+
+    rnd_net = RND().to(a.device)
+    rnd_opt = torch.optim.Adam(rnd_net.predictor.parameters(), lr=1e-4)
     pool: list[dict] = []
     best = -1e9
     betas = [1.0, 0.5, 0.3, 0.2, 0.2, 0.2, 0.2, 0.2]
@@ -259,7 +282,23 @@ def main():
         pool += eps
         if len(pool) > a.max_pool:
             pool = pool[-a.max_pool:]
-        train(model, pool, a.epochs, a.device, lr=a.lr, log=log, sil=a.sil if rnd >= 1 else 0.0)  # round 0: value warm-up only
+        for e in eps:
+            e["round"] = rnd
+        # learned-curiosity module: train the predictor on this round's states, save it for the next round
+        xs = torch.from_numpy(np.concatenate([np.concatenate([e["x"].astype(np.float32), e["m"].astype(np.float32)], axis=1) for e in eps[:120]])).to(a.device)
+        errs = []
+        for _ in range(150):
+            idxr = torch.randint(0, xs.shape[0], (4096,), device=a.device)
+            err = rnd_net.error(xs[idxr])
+            rnd_opt.zero_grad(); err.mean().backward(); rnd_opt.step()
+            errs.append(float(err.mean().detach()))
+        with torch.no_grad():
+            rnd_net.err_mean.fill_(float(np.mean(errs[-30:])))
+        torch.save(rnd_net.state_dict(), out / "rnd.pt")
+        del xs
+        log(f"  curiosity module: prediction error {np.mean(errs[:10]):.4f} -> {np.mean(errs[-10:]):.4f}")
+        warm = rnd >= 1  # round 0: value warm-up only
+        train(model, pool, a.epochs, a.device, lr=a.lr, log=log, sil=a.sil if warm else 0.0, pg=a.pg if warm else 0.0, fresh_round=rnd)
         torch.save({"model": model.state_dict()}, out / "last.pt")
         parts = [(evaluate(h, "agent", str(out / "last.pt"), a.workers)[0]) for h in a.heldout]
         n_tot = sum(p_["maps"] for p_ in parts)

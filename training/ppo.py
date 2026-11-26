@@ -29,7 +29,9 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 
-REWARD = {"exit": 10.0, "key": 3.0, "door": 0.5, "lock": 3.0, "area": 0.15, "kill": 0.5, "damage": 0.01, "death": 5.0, "step": 0.002, "stuck": 0.02}
+REWARD = {"exit": 10.0, "key": 3.0, "door": 0.5, "lock": 3.0, "curiosity": 0.05, "kill": 0.5, "damage": 0.01, "death": 5.0,
+          "step": 0.002, "stuck": 0.02, "rnd": 0.02}
+RET_SCALE = 5.0  # same return scale as training/dagger.py, so its trained value head is a valid critic here
 
 
 def rollout(args) -> dict:
@@ -42,6 +44,7 @@ def rollout(args) -> dict:
 
     from actions import NEXTW_ACTIONS, NUM_ACTIONS, USE_ACTIONS, to_buttons
     from model import OBS_DIM, Perception, Policy
+    from rnd import RND
     from scorer import AREA, Tracker
     from teacher import Teacher, dir_bin, door_open_fn
 
@@ -55,6 +58,11 @@ def rollout(args) -> dict:
     model.load_state_dict(torch.load(weights, map_location="cpu", weights_only=True)["model"])
     model.eval()
     h = model.initial_state(1)
+    rnd = RND()
+    rnd_path = Path(weights).with_name("rnd.pt")
+    if rnd_path.exists():
+        rnd.load_state_dict(torch.load(rnd_path, map_location="cpu", weights_only=True))
+    seen_cells: set = set()
     p0 = env.privileged_state()
     tracker = Tracker(p0)
     areas = {(math.floor(p0["x"] / AREA), math.floor(p0["y"] / AREA))}
@@ -91,9 +99,11 @@ def rollout(args) -> dict:
         stuck_now = len(trail) > 20 and math.hypot(pr["x"] - trail[-21][0], pr["y"] - trail[-21][1]) < 24.0
         if stuck_now:
             r -= REWARD["stuck"]
-        cell = (math.floor(pr["x"] / AREA), math.floor(pr["y"] / AREA))
-        if cell not in areas:
-            areas.add(cell); r += REWARD["area"]
+        # intrinsic 1: a cell of the agent's OWN SLAM map it has never stood in
+        sl = perception.slam
+        cell = (int((sl.x + 32) // 64), int((sl.y + 32) // 64))
+        if cell not in seen_cells:
+            seen_cells.add(cell); r += REWARD["curiosity"]
         r += REWARD["key"] * (res.keys - last["keys"]) + REWARD["door"] * (res.doors_opened - last["doors"])
         r += REWARD["lock"] * (res.locks_opened - last["locks"]) + REWARD["kill"] * (res.kills - last["kills"])
         r -= REWARD["damage"] * (res.damage - last["damage"])
@@ -107,9 +117,25 @@ def rollout(args) -> dict:
         if term or trunc:
             break
     env.close()
+    # intrinsic 2: learned curiosity (random network distillation) over observation + wide map view
+    xs = np.concatenate([np.stack(X).astype(np.float32), np.stack(M).astype(np.float32)], axis=1)
+    nov = rnd.novelty(torch.from_numpy(xs)).numpy()
+    R = [r_ + REWARD["rnd"] * float(n_) for r_, n_ in zip(R, nov[1:].tolist() + [0.0])]  # novelty of the state reached
     out = tracker.result(Path(item["path"]).name, item["tier"]).as_dict()
+    out["novelty"] = float(nov.mean())
     return {"x": np.stack(X), "m": np.stack(M), "pa": np.array(PA, np.int16), "a": np.array(A, np.int16), "lp": np.array(LP, np.float32),
             "r": np.array(R, np.float32), "y": np.array(Y, np.int16), "d": np.array(D, np.int16), "w": np.array(W, np.float32), "truncated": bool(trunc and not term), "result": out}
+
+
+def evaluate_sets(evaluate, sets, weights, workers) -> dict:
+    """Map-count-weighted mean of the weighted score over several held-out sets."""
+    parts = [evaluate(h, "agent", weights, workers)[0] for h in sets]
+    n = sum(p["maps"] for p in parts)
+    out = {"weighted": sum(p["weighted"] * p["maps"] for p in parts) / n, "maps": n}
+    for k in ("t1", "t2", "t3", "t4"):
+        if all(k in p for p in parts):
+            out[k] = {f: sum(p[k][f] * p["maps"] for p in parts) / n for f in ("score", "exit", "dead", "stuck")}
+    return out
 
 
 def masked_logits(logits, prev, use_ids, nextw_ids):
@@ -126,7 +152,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--init", required=True)
     ap.add_argument("--maps", default=str(ROOT / "maps_gen" / "train"))
-    ap.add_argument("--heldout", default=str(ROOT / "maps_gen" / "heldout"))
+    ap.add_argument("--heldout", nargs="+", default=[str(ROOT / "maps_gen" / "heldout"), str(ROOT / "maps_gen" / "heldout2")])
     ap.add_argument("--out", default=str(ROOT / "runs" / "ppo1"))
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--episodes", type=int, default=28)
@@ -172,13 +198,18 @@ def main():
     model.detach_value = True
     torch.save({"model": model.state_dict()}, out / "last.pt")
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
+    from rnd import RND
+
+    rnd = RND().to(dev)
+    rnd_opt = torch.optim.Adam(rnd.predictor.parameters(), lr=1e-4)
+    torch.save(rnd.state_dict(), out / "rnd.pt")
     items = json.loads((Path(a.maps) / "index.json").read_text())
     use_ids = torch.tensor(USE_ACTIONS, device=dev)
     nextw_ids = torch.tensor(NEXTW_ACTIONS, device=dev)
 
-    summary, _ = evaluate(a.heldout, "agent", a.init, a.workers)
+    summary = evaluate_sets(evaluate, a.heldout, a.init, a.workers)
     best = summary["weighted"]
-    log(f"start: held-out weighted {best:.1f}")
+    log(f"start: held-out ({summary['maps']} maps) weighted {best:.1f}")
     torch.save({"model": model.state_dict(), "iter": 0, "heldout": summary}, out / "best.pt")
 
     rng = np.random.default_rng(1)
@@ -214,8 +245,7 @@ def main():
                 vals.append(torch.cat(row, dim=1))
         values = torch.cat(vals, dim=0).numpy() * m
         # reward scaling by a running estimate of return std
-        ret_rms = 0.95 * ret_rms + 0.05 * float(np.std(rew[m > 0]) * math.sqrt(1.0 / (1 - a.gamma)) + 1e-3)
-        scale = 1.0 / max(ret_rms, 1e-3)
+        scale = 1.0 / RET_SCALE
         adv = np.zeros_like(rew)
         for i, e in enumerate(eps):
             k = len(e["a"])
@@ -232,6 +262,20 @@ def main():
         tadv, tret = torch.from_numpy(adv).to(dev), torch.from_numpy(ret.astype(np.float32)).to(dev)
 
         # ---- PPO update (truncated BPTT, chunks of 64, hidden carried)
+        # ---- train the curiosity predictor on the states just visited
+        flat = tx[tm > 0]
+        rnd_losses = []
+        for _ in range(4):
+            idxr = torch.randint(0, flat.shape[0], (4096,), device=dev)
+            err = rnd.error(flat[idxr])
+            rnd_opt.zero_grad(); err.mean().backward(); rnd_opt.step()
+            rnd_losses.append(float(err.mean().detach()))
+        with torch.no_grad():
+            if it == 1:
+                rnd.err_mean.fill_(float(np.mean(rnd_losses)))  # set the scale from the first batch
+            else:
+                rnd.err_mean.mul_(0.9).add_(0.1 * float(np.mean(rnd_losses)))
+        torch.save(rnd.state_dict(), out / "rnd.pt")
         model.train()
         stats = []
         for _ in range(a.epochs):
@@ -277,10 +321,10 @@ def main():
         s = np.mean(stats, 0)
         res = [e["result"] for e in eps]
         log(f"it {it}: exit {np.mean([r['exit'] for r in res]):.2f} dead {np.mean([r['dead'] for r in res]):.2f} "
-            f"score {np.mean([r['score'] for r in res]):.1f} | pl {s[0]:.3f} vl {s[1]:.3f} ent {s[2]:.2f} bc {s[3]:.2f} clip {s[4]:.2f} "
+            f"score {np.mean([r['score'] for r in res]):.1f} novelty {np.mean([r['novelty'] for r in res]):.2f} | pl {s[0]:.3f} vl {s[1]:.3f} ent {s[2]:.2f} bc {s[3]:.2f} clip {s[4]:.2f} "
             f"bcw {bc:.3f} | {sum(len(e['a']) for e in eps)} steps, collect {t_col:.0f}s total {time.time() - t0:.0f}s")
         if it % a.eval_every == 0:
-            summary, _ = evaluate(a.heldout, "agent", str(out / "last.pt"), a.workers)
+            summary = evaluate_sets(evaluate, a.heldout, str(out / "last.pt"), a.workers)
             log(f"it {it} held-out: weighted {summary['weighted']:.1f} " + " ".join(
                 f"t{k}: {summary[f't{k}']['score']:.1f}/{summary[f't{k}']['exit']:.2f}" for k in (1, 2, 3, 4) if f"t{k}" in summary))
             if summary["weighted"] > best:
