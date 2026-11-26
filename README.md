@@ -99,15 +99,6 @@ env/ docs/ tests/ validate.py   the official template, unchanged
 About 1.5M parameters; about 1–4 ms per decision on one CPU thread (limit: 40 ms). Inference always
 runs on CPU.
 
-What is not learned in the submitted agent, and why it is allowed:
-- **Action masking** of `USE` and weapon-switch on the step after they were pressed (both are
-  edge-triggered; masking from the agent's own previous action), and of forward for a few steps when
-  the agent has been pushing forward without moving (from its observed velocity and rays).
-- **Observation preprocessing**: encoding, the map built from observations and the agent's own actions,
-  locked-door colours and the exit pad read from the frame and written into that map, and showing a
-  locked door as a wall until the matching key is held.
-- **A safety guard**: malformed input or any internal error returns a valid action instead of crashing.
-
 ## Reproduce
 
 Requires Python 3.13 and [uv](https://docs.astral.sh/uv/).

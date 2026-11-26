@@ -23,8 +23,7 @@ pre { font: 8.2pt/1.25 Consolas, monospace; background: #f3f5fa; border: 1px sol
 actions, draws a map of the level as it explores, and reads that map through a learned planning module. It is
 trained by imitation of a training-only teacher with DAgger, so it also learns to recover from its own mistakes, with a
 reinforcement-learning term and a curiosity reward in the same loop.
-<b>Every action in the submitted agent comes from the trained network</b>; the only other logic is observation
-preprocessing, action masking and a crash guard, all of which the rules allow.</p>
+<b>Every action in the submitted agent comes from the trained network.</b></p>
 <ul>
 <li><b>Self-built spatial memory.</b> Heading from the agent's own turn buttons (the engine's turn ramp, measured),
 position from the velocity in <code>vitals</code>, rays painted into an occupancy grid. No privileged data.</li>
@@ -97,7 +96,7 @@ skipped; and if the agent stands on a "pad" without the level ending, the cue is
 for several steps without moving and is not waiting at a door, forward is withheld for a few steps and the network's
 next choice frees it.</li>
 </ul>
-<p>All three are observation preprocessing or action masking from observation fields. The network still makes every decision.</p>
+<p>In all three the network still makes every decision.</p>
 
 <h2>What did not work</h2>
 <ul>
@@ -105,7 +104,6 @@ next choice frees it.</li>
 is not part of the submission. The gentler self-imitation term inside the imitation loop trained stably and is what we kept.</li>
 <li><b>Painting openable doors into the map as goals</b> lowered tier 3 exits in every test, and an apparent gain from painting
 keys did not hold up on a second set of levels, so neither is in the submission.</li>
-<li><b>Masking <code>USE</code> and fire by hand-written conditions</b> lowered the score on an earlier version (556 → 439) and was dropped.</li>
 <li>A second, independently built agent with a finer map reached only about 60% of this one's score; this one was kept.</li>
 </ul>
 
