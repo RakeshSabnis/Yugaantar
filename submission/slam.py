@@ -31,6 +31,7 @@ WIDE = 16             # zoomed-out crop: WIDE x WIDE coarse cells...
 WIDE_CELL = 256.0     # ...each 256 map units (4 x 4 fine cells), spanning 4096 x 4096 units around us
 
 F_IDX, B_IDX, SL_IDX, SR_IDX, TL_IDX, TR_IDX = 0, 1, 2, 3, 4, 5
+USE_IDX = 7
 _RAY_ANG = np.arange(NUM_RAYS) * (2 * math.pi / NUM_RAYS)
 DEPTH_UNITS = 7.6     # map units per depth-buffer level (measured)
 EXIT_CUE = __import__("os").environ.get("DOOM_EXIT", "1") == "1"  # paint seen exit pads into the map as frontier
@@ -52,6 +53,10 @@ class Slam:
         self.keys = np.zeros(4, bool)                  # keys held, by the same colour index
         self.exit = np.zeros((SIZE, SIZE), np.uint8)   # cells where an exit pad has been seen
         self.exit_false = 0
+        self.tried = np.zeros((SIZE, SIZE), np.uint8)  # locked doors we pressed USE on that stayed shut
+        self.pending: list = []   # (cell x, cell y, step at which to check whether the door opened)
+        self.used_last = False    # did our last action press USE?
+        self.keys_n = 0           # how many key flags are set in the vitals
         self.x = 0.0
         self.y = 0.0
         self.heading = 0.0  # radians, odometry frame (0 = facing direction at the start of the map)
@@ -65,6 +70,7 @@ class Slam:
     def apply_action(self, buttons) -> None:
         """Call with the buttons we just sent, before the next observation arrives."""
         b = np.asarray(buttons).reshape(-1)
+        self.used_last = bool(b[USE_IDX] > 0)
         turn = int(b[TL_IDX] > 0) - int(b[TR_IDX] > 0)
         if turn != 0:
             self.turn_streak += 1
@@ -133,8 +139,9 @@ class Slam:
         self._paint(obs)
 
     def _cell(self, x, y):
-        return (np.floor(np.asarray(x) / CELL).astype(np.int64) + SIZE // 2,
-                np.floor(np.asarray(y) / CELL).astype(np.int64) + SIZE // 2)
+        # +CELL/2: the start position is the centre of a map cell, so walls fall on cell borders
+        return (np.floor((np.asarray(x) + CELL / 2) / CELL).astype(np.int64) + SIZE // 2,
+                np.floor((np.asarray(y) + CELL / 2) / CELL).astype(np.int64) + SIZE // 2)
 
     def _paint(self, obs: dict) -> None:
         rays = obs["rays"]
@@ -149,6 +156,11 @@ class Slam:
         cx, cy = self._cell(fx.ravel(), fy.ravel())
         ok = (cx >= 0) & (cx < SIZE) & (cy >= 0) & (cy < SIZE)
         self.free[cy[ok], cx[ok]] = 1
+        # a ray passing through a cell means any door there is open now: drop the stale door mark
+        stale = self.hit[cy[ok], cx[ok]] >= 2
+        if stale.any():
+            self.hit[cy[ok][stale], cx[ok][stale]] = 0
+            self.tried[cy[ok][stale], cx[ok][stale]] = 0
         # hits: walls / doors / locked doors (enemies and items are transient: not mapped)
         solid = (ht >= 1) & (ht <= 3) & (d < RAY_RANGE - 1)
         if solid.any():
@@ -160,6 +172,26 @@ class Slam:
         self._door_colours(obs, d, ht, dx, dy)
         self._exit_pads(obs)
         # an open door the ray now passes through: clear stale door marks along free space
+        # Memory of failed attempts: we pressed USE facing a locked door; if it is still marked locked a
+        # little later (a door that accepts our key is open by then), remember it as "tried".
+        keys_n = int(np.sum(np.nan_to_num(np.asarray(obs["vitals"], np.float64).reshape(-1)[8:14]) > 0.5))
+        if keys_n > self.keys_n:
+            self.tried[:] = 0      # a new key: every locked door is worth trying again
+            self.pending = []
+        self.keys_n = keys_n
+        if self.used_last and ht[0] == 3 and d[0] < 110.0:
+            tx, ty = self._cell(self.x + dx[0] * (d[0] + 4.0), self.y + dy[0] * (d[0] + 4.0))
+            self.pending.append((int(tx), int(ty), self.steps + 12))
+        self.used_last = False
+        if self.pending:
+            keep = []
+            for tx, ty, due in self.pending:
+                if self.steps < due:
+                    keep.append((tx, ty, due))
+                    continue
+                y0, y1, x0, x1 = max(0, ty - 1), min(SIZE, ty + 2), max(0, tx - 1), min(SIZE, tx + 2)
+                self.tried[y0:y1, x0:x1] |= (self.hit[y0:y1, x0:x1] == 3).astype(np.uint8)
+            self.pending = keep
         px, py = self._cell(self.x, self.y)
         if 0 <= px < SIZE and 0 <= py < SIZE:
             self.visit[max(0, py - 1):py + 2, max(0, px - 1):px + 2] = 1
@@ -268,7 +300,8 @@ class Slam:
     # ------------------------------------------------------------------ network input
     def crop_packed(self) -> np.ndarray:
         """(CROP, CROP) uint8 ego-centric map, one bit per layer: 1 free, 2 wall, 4 door, 8 locked door,
-        16 visited, 32 frontier (seen floor next to unexplored space). Unknown = no free/hit bit. Row 0 = ahead, column 0 = left."""
+        16 visited, 32 frontier (seen floor next to unexplored space), 64 we hold a key (whole plane),
+        128 locked door we tried and it stayed shut. Unknown = no free/hit bit. Row 0 = ahead, column 0 = left."""
         k = (np.arange(CROP) - CROP / 2 + 0.5) * CROP_CELL
         fwd = -k[:, None] * np.ones((1, CROP))
         left = -k[None, :] * np.ones((CROP, 1))
@@ -285,13 +318,14 @@ class Slam:
         for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             unknown_nb |= ~known[np.clip(cy + dy, 0, SIZE - 1), np.clip(cx + dx, 0, SIZE - 1)]
         frontier = ((free > 0) & (hit == 0) & unknown_nb) | ((self.exit[cy, cx] > 0) & (hit == 0))
-        out = free | ((hit == 1) << 1) | ((hit == 2) << 2) | ((hit == 3) << 3) | (self.visit[cy, cx] << 4) | (frontier.astype(np.uint8) << 5)
+        out = (free | ((hit == 1) << 1) | ((hit == 2) << 2) | ((hit == 3) << 3) | (self.visit[cy, cx] << 4) | (frontier.astype(np.uint8) << 5)
+               | (int(self.keys_n > 0) << 6) | (self.tried[cy, cx].astype(np.int64) << 7))
         return (out * ok).astype(np.uint8)
 
     def wide_packed(self) -> np.ndarray:
         """(WIDE, WIDE) uint8 zoomed-out ego-centric view, one bit per layer, each true if ANY of the
         4x4 fine cells under the coarse cell has it: 1 seen floor, 2 visited, 4 frontier, 8 door,
-        16 locked door, 32 wall. Lets the network see unexplored space well beyond the fine crop."""
+        16 locked door, 32 wall, 64 we hold a key (whole plane), 128 a tried locked door. Lets the network see unexplored space well beyond the fine crop."""
         sub = (np.arange(4) - 1.5) * CELL
         k = (np.arange(WIDE) - WIDE / 2 + 0.5) * WIDE_CELL
         fwd = (-k[:, None, None, None] + sub[None, None, :, None]) * np.ones((WIDE, WIDE, 4, 4))
@@ -310,7 +344,8 @@ class Slam:
         frontier = (free & (hit == 0) & unknown_nb) | ((self.exit[cy, cx] > 0) & ok & (hit == 0))
         anyf = lambda a: a.any(axis=(2, 3)).astype(np.uint8)  # noqa: E731
         return (anyf(free) | (anyf((self.visit[cy, cx] > 0) & ok) << 1) | (anyf(frontier) << 2)
-                | (anyf(hit == 2) << 3) | (anyf(hit == 3) << 4) | (anyf(hit == 1) << 5)).astype(np.uint8)
+                | (anyf(hit == 2) << 3) | (anyf(hit == 3) << 4) | (anyf(hit == 1) << 5)
+                | (np.uint8(self.keys_n > 0) << 6) | (anyf((self.tried[cy, cx] > 0) & ok) << 7)).astype(np.uint8)
 
     def crop(self) -> np.ndarray:
         """(CHANNELS, CROP, CROP) float32 ego-centric map: row 0 = ahead, column 0 = left."""

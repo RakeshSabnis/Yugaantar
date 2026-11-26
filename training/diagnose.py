@@ -42,7 +42,7 @@ def run(args):
     rows = grid.strip("\n").split("\n")
     h = len(rows)
     locks = [(r, c, ch) for r, row in enumerate(rows) for c, ch in enumerate(row) if ch in KEY_OF]
-    env = make_env(item["path"], "MAP01", episode_ticks=item["ticks"], render_buffers=True)  # frames on: the door-colour filter reads them
+    env = make_env(item["path"], "MAP01", episode_ticks=item["ticks"], render_buffers=False)
     obs, _ = env.reset(seed=seed)
     door_open = door_open_fn(env, grid)
     if policy == "teacher":

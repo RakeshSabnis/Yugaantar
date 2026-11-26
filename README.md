@@ -10,8 +10,36 @@ pathfinding or aim maths in the submitted agent.
 
 Pure reinforcement learning rarely discovers keycard → locked door → exit in a few hours. We first train
 the network to imitate a **training-only scripted teacher** with DAgger (the network plays, the teacher
-labels every state it visits, so the network learns to recover from its own mistakes). The agent keeps its own **SLAM-style map** of the level, built only
+labels every state it visits, so the network learns to recover from its own mistakes). The same loop carries a
+**reinforcement-learning term with a curiosity reward** (below). The agent keeps its own **SLAM-style map** of the level, built only
 from its observations and its own actions, and reads it through a **learned planner module**.
+
+## Reinforcement learning and curiosity in training
+
+`training/dagger.py` is not pure imitation. Every game the network plays is also scored with a shaped
+reward that mirrors the scoring categories (exit, keys, doors, locks, kills, minus damage, death and
+time), plus an **intrinsic curiosity reward for entering a cell of its own map that it has never stood
+in**. The value head regresses the return, and actions that did better than the value predicted are
+reinforced (self-imitation, `--sil`); an actor-critic policy-gradient term (`--pg`) and a learned
+novelty bonus (random network distillation, `training/rnd.py`) are in the same loop. Everything here
+runs in training only; the submitted agent contains none of it.
+
+Stand-alone PPO fine-tuning of the imitation policy lowered the held-out score in every configuration
+we tried, so it is not part of this repository.
+
+## Results of the submitted agent
+
+Network playing alone on two sets of 192 held-out generated levels (48 per tier, never trained on),
+local scorer:
+
+| | Set A | Set B |
+| --- | --- | --- |
+| Network as trained | 1065 | 1101 |
+| + door colours, exit pads and jam mask (submitted) | **1192** | **1203** |
+
+Exits for the submitted agent, averaged over both sets: tier 1 64%, tier 2 70%, tier 3 54%, tier 4 18%.
+The sections below describe the three additions; the figures quoted in them were measured on the
+previous weights.
 
 ## Door colours from the frame
 
