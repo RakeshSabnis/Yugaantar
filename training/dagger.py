@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -28,7 +29,10 @@ import numpy as np  # noqa: E402
 GOAL_ID = {"": 0, "exit": 1, "key": 2, "frontier": 3, "revisit": 4}
 # Reward for the RL term (self-imitation). Scoring-shaped terms use privileged state in training only;
 # "curiosity" is intrinsic: a new cell in the agent's own SLAM map.
-REWARD = {"exit": 10.0, "key": 3.0, "door": 0.5, "lock": 3.0, "curiosity": 0.05, "kill": 0.5, "damage": 0.01, "death": 5.0, "step": 0.002, "rnd": 0.005}
+REWARD = {"exit": 10.0, "key": 3.0, "door": 0.5, "lock": 3.0, "curiosity": 0.05, "kill": 0.5, "damage": 0.01, "death": 5.0, "step": 0.002, "rnd": 0.005,
+          "see": 0.002,      # per newly SEEN cell of the agent's own map: clearing a room with one look pays
+          "blocked": 0.02,   # per step standing at a locked door whose key the agent does not hold
+          "stuck": 0.02}     # per step without movement
 GAMMA = 0.995
 RET_SCALE = 5.0
 
@@ -75,6 +79,13 @@ def collect_episode(args) -> dict:
     X, M, PA, Y, G, L, D, A, R, OWN = [], [], [], [], [], [], [], [], [], []
     last = {"keys": 0, "doors": 0, "locks": 0, "kills": 0, "damage": 0.0}
     seen_cells: set = set()
+    W = []                    # per-step weight of the teacher term (3x where the agent is stuck or blocked)
+    hard_now = False
+    trail: list = []
+    seen_area = 0
+    grid_rows = grid.strip("\n").split("\n")
+    lock_cells = [(r_, c_, ch) for r_, row in enumerate(grid_rows) for c_, ch in enumerate(row) if ch in "RBY"]
+    key_vital = {"B": 8, "Y": 9, "R": 10}
     prev, locked_seen = 0, 0
     while True:
         priv = env.privileged_state()
@@ -97,6 +108,7 @@ def collect_episode(args) -> dict:
                 a = int(rng.choice(NUM_ACTIONS, p=p))
                 own = 1
         OWN.append(own)
+        W.append(3.0 if hard_now else 1.0)
         # keep the teacher's own memory of its last action consistent with what was executed
         teacher.prev_action = a
         teacher.prev_use = a in USE_ACTIONS
@@ -121,6 +133,26 @@ def collect_episode(args) -> dict:
             rew += REWARD["exit"] * (1.0 + 0.5 * (1.0 - res.tic / res.ticks))
         if res.dead:
             rew -= REWARD["death"]
+        # seeing new space (from the agent's own map)
+        area_now = int(sl.free.sum())
+        rew += REWARD["see"] * max(0, area_now - seen_area)
+        seen_area = area_now
+        # standing still, or standing at a locked door it cannot open (privileged check, training only)
+        pr_ = env.privileged_state()
+        trail.append((pr_["x"], pr_["y"]))
+        stuck_now = len(trail) > 20 and math.hypot(pr_["x"] - trail[-21][0], pr_["y"] - trail[-21][1]) < 24.0
+        blocked_now = False
+        for r_, c_, ch in lock_cells:
+            if obs["vitals"][key_vital[ch]] > 0.5 or obs["vitals"][key_vital[ch] + 3] > 0.5 or door_open(r_, c_):
+                continue
+            if math.hypot(pr_["x"] - (c_ * 64 + 32), pr_["y"] - ((len(grid_rows) - 1 - r_) * 64 + 32)) < 110:
+                blocked_now = True
+                break
+        if stuck_now:
+            rew -= REWARD["stuck"]
+        if blocked_now:
+            rew -= REWARD["blocked"]
+        hard_now = stuck_now or blocked_now
         A.append(a); R.append(rew)
         prev = a
         if term or trunc:
@@ -138,7 +170,7 @@ def collect_episode(args) -> dict:
         R = [r_ + REWARD["rnd"] * float(n_) for r_, n_ in zip(R, nov[1:].tolist() + [0.0])]
     final = tracker.result(Path(item["path"]).name, item["tier"]).as_dict()
     return {"x": np.stack(X), "m": np.stack(M), "pa": np.array(PA, np.int16), "y": np.array(Y, np.int16), "g": np.array(G, np.int8),
-            "l": np.array(L, np.int8), "d": np.array(D, np.int8), "a": np.array(A, np.int16), "own": np.array(OWN, np.int8), "ret": discounted(R), "result": final}
+            "l": np.array(L, np.int8), "d": np.array(D, np.int8), "a": np.array(A, np.int16), "own": np.array(OWN, np.int8), "w": np.array(W, np.float32), "ret": discounted(R), "result": final}
 
 
 def collect(items, weights, beta, workers, seed0, temperature=0.5):
@@ -171,13 +203,14 @@ def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=prin
             dd = np.zeros((B, T), np.int64)
             aa = np.zeros((B, T), np.int64)
             gg = np.zeros((B, T), np.float32)
+            ww = np.ones((B, T), np.float32)
             fr = np.zeros((B, T), np.float32)  # 1 where the network itself chose the action, in this round's games
             lk = np.zeros((B, T), np.float32)
             m = np.zeros((B, T), np.float32)
             for i, e in enumerate(eps):
                 k = len(e["y"])
-                x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; y[i, :k] = e["y"]; g[i, :k] = e["g"]; dd[i, :k] = e["d"]; aa[i, :k] = e["a"]; gg[i, :k] = e["ret"]; fr[i, :k] = e["own"] * float(e.get("round", -2) == fresh_round); lk[i, :k] = e["l"]; m[i, :k] = 1
-            x, pa, y, g, dd, lk, m, aa, gg, fr = (torch.from_numpy(a).to(device) for a in (x, pa, y, g, dd, lk, m, aa, gg, fr))
+                x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; y[i, :k] = e["y"]; g[i, :k] = e["g"]; dd[i, :k] = e["d"]; aa[i, :k] = e["a"]; gg[i, :k] = e["ret"]; ww[i, :k] = e.get("w", 1.0); fr[i, :k] = e["own"] * float(e.get("round", -2) == fresh_round); lk[i, :k] = e["l"]; m[i, :k] = 1
+            x, pa, y, g, dd, lk, m, aa, gg, fr, ww = (torch.from_numpy(a).to(device) for a in (x, pa, y, g, dd, lk, m, aa, gg, fr, ww))
             h = model.initial_state(B, device)
             for t0c in range(0, T, chunk):
                 sl = slice(t0c, t0c + chunk)
@@ -204,7 +237,8 @@ def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=prin
                 adv_full = (ret - val.detach()).clamp(-2.0, 2.0)
                 pg_loss = -(adv_full * logp_a) * fr[:, sl]
                 rl = (0.5 * vloss + sil * sil_loss + pg * pg_loss).reshape(-1)
-                loss = ((ce + 0.2 * ceg + 0.2 * bce + 0.5 * ced + rl) * mf).sum() / mf.sum()
+                wt = ww[:, sl].reshape(-1)  # the teacher's decision counts 3x where the agent was stuck or blocked
+                loss = (((ce + 0.5 * ced) * wt + 0.2 * ceg + 0.2 * bce + rl) * mf).sum() / mf.sum()
                 vsum += float((vloss.reshape(-1) * mf).sum().detach()); ssum += float((adv.reshape(-1) * mf).sum())
                 dcorrect += float(((ad.argmax(-1) == dd[:, sl]).float() * mm).sum())
                 opt.zero_grad()
