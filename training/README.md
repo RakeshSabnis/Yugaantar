@@ -36,5 +36,4 @@ bash training/aws_run.sh                                                        
 ## Status and next steps
 
 - Done: generator, scorer, teacher, memory, network, agent, imitation pipeline, viewer; DAgger rounds are run on AWS (training/aws_run.sh).
-- Not done yet: the full imitation run (AWS), PPO fine-tuning with a curiosity bonus on top of the
-  imitation weights, mixing Freedoom/community WADs into training as a different-style check.
+- Not done yet: PPO fine-tuning with a curiosity bonus on top of the imitation weights.
