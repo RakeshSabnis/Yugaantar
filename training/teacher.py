@@ -241,11 +241,12 @@ class Teacher:
                         for ox in range(-5, 6):
                             for oy in range(-5, 6):
                                 self.used[(hx + ox) % G, (hy + oy) % G] = True
-                        self.use_cd = 14
+                        self.use_cd = 9
                         self.use_wait += 1
                         return a
                 else:
-                    return a  # wait for the door
+                    a[FWD] = 1  # lean on the door so we walk through the moment it clears
+                    return a
         else:
             self.use_wait = 0
 
@@ -271,8 +272,8 @@ class Teacher:
             a[TL if err > 0 else TR] = 1
         elif abs(err) > math.radians(3):
             a[LEFT if err > 0 else RIGHT] = 1
-        if abs(err) < math.radians(35):
-            a[FWD] = 1
+        if abs(err) < math.radians(60):
+            a[FWD] = 1  # keep moving through turns; stopping to turn costs more time than a wide arc
         # keep off the walls
         if rays_d[16] < 22 and rays_d[48] > 30:
             a[RIGHT], a[LEFT] = 1, 0

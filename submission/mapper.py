@@ -39,7 +39,8 @@ DISP_PREV, DISP_END = 1.53, 2.89
 # Exit pads are not in the rays or the entity list; the only cue is the frame. The exit floor is
 # saturated red, and the depth buffer places each such pixel: forward = depth * DEPTH_UNITS, and a
 # floor pixel at image row y satisfies forward * (y - HORIZON) ~= FLOOR_K (eye height x focal length).
-DEPTH_UNITS, HORIZON, FLOOR_K, FLOOR_TOL = 7.6, 60.0, 3800.0, 1000.0
+DEPTH_UNITS, HORIZON, FLOOR_K, FLOOR_TOL = 7.6, 60.0, 3800.0, 600.0
+MIN_PAD_SPAN = 20.0  # map units of ground a red column must cover to count as exit floor
 _PIX_ROWS = np.arange(62, 120, dtype=np.float64)[:, None]
 _PIX_LEFT = ((79.5 - np.arange(160)) / 80.0)[None, :]
 
@@ -69,6 +70,7 @@ class Mapper:
         self.x = self.y = self.h = 0.0
         self.turn_held = 0
         self.tic = 0
+        self.exit_false = 0  # times we stood on a "detected exit" and the level did not end
         self.prev_vel = np.zeros(2)  # world frame
         self.steps = 0
 
@@ -141,15 +143,33 @@ class Mapper:
             ex, ey = d * f[:, 2], d * f[:, 1]  # forward, left
             kx, ky = self.cell(self.x + ex * c - ey * s, self.y + ex * s + ey * c)
             L[KEY, kx, ky] = 1
+        if L[EXIT, px, py]:
+            # Reaching a real exit ends the episode, so standing on a marked cell means the cue is
+            # wrong on this map (a red floor, say). After a few such misses stop trusting it.
+            self.exit_false += 1
+            if self.exit_false >= 3:
+                L[EXIT] = 0
         L[EXIT, ((px + np.arange(-2, 3)) % G)[:, None], ((py + np.arange(-2, 3)) % G)[None, :]] = 0  # stood there: not an exit
         rgb = obs.get("rgb")
-        if rgb is not None:
+        if rgb is not None and self.exit_false < 3:
             lo = np.asarray(rgb)[62:]
             r = lo[..., 0].astype(np.int16)
             red = (r > 80) & (lo[..., 1] < r * 0.35) & (lo[..., 2] < r * 0.35)
             if red.any():
+                # Taking damage tints the whole screen red for a few frames. Then the upper part of
+                # the frame (walls, ceiling) is red too, or most of the floor is: skip such frames.
+                top = np.asarray(rgb)[:40]
+                tr = top[..., 0].astype(np.int16)
+                if ((tr > 80) & (top[..., 1] < tr * 0.35) & (top[..., 2] < tr * 0.35)).mean() > 0.10 or red.mean() > 0.35:
+                    red[:] = False
+            if red.any():
                 fwd = np.asarray(obs["depth"])[62:].astype(np.float64) * DEPTH_UNITS
                 red &= np.abs(fwd * (_PIX_ROWS - HORIZON) - FLOOR_K) < FLOOR_TOL
+                # Blood, corpses and fireballs are red too, but they are upright sprites: every
+                # pixel of one has the same depth. A pad lies flat, so along an image column its
+                # depth changes from row to row. Keep only columns whose red run spans real ground.
+                span = np.where(red, fwd, -np.inf).max(0) - np.where(red, fwd, np.inf).min(0)
+                red &= ((red.sum(0) >= 2) & (span >= MIN_PAD_SPAN))[None, :]
                 if red.sum() >= 3:
                     f = fwd[red]
                     lf = (fwd * _PIX_LEFT)[red]

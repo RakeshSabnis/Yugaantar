@@ -32,7 +32,7 @@ KEYS = {"r": 13, "b": 5, "y": 6}
 LOCKS = {"R": 129, "B": 130, "Y": 131}  # ZDoom lock numbers: any red / blue / yellow key
 LOCK_OF_KEY = {"r": "R", "b": "B", "y": "Y"}
 DOOR_TEX = {"D": "BIGDOOR2", "R": "DOORRED", "B": "DOORBLU", "Y": "DOORYEL"}
-FLOORS = ("FLOOR0_1", "FLOOR4_8", "FLAT14", "FLOOR5_1", "FLAT1", "FLOOR0_3")
+FLOORS = ("FLOOR0_1", "FLOOR4_8", "FLAT14")  # the floor flats the organisers' own maps use
 WALLS = ("STARTAN2", "STONE2", "BROWN1", "GRAY1", "BRICK1", "METAL1")
 DOORS = "DRBY"
 

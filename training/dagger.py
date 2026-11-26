@@ -208,6 +208,7 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=8)
     ap.add_argument("--episodes", type=int, default=400, help="new training levels per iteration")
     ap.add_argument("--train-steps", type=int, default=3000)
+    ap.add_argument("--first-steps", type=int, default=0, help="training steps for round 0 (it starts from scratch); 0 = same as --train-steps")
     ap.add_argument("--eval-levels", type=int, default=48)
     ap.add_argument("--data", default="data/dagger")
     ap.add_argument("--start-iter", type=int, default=0, help="resume: reuse data of earlier iterations")
@@ -241,7 +242,7 @@ def main() -> None:
         log(f"iter {it}: collected {n} steps from {len(rows)} levels in {time.time() - t0:.0f}s (teacher drives {beta:.0%}); "
             f"exit {np.mean([r['exit'] for r in rows]):.2f}, memory drift median {np.median([r['drift'] for r in rows]):.0f} units")
         eps = load([data / f"iter_{k:02d}" for k in range(it + 1)])
-        train(eps, args.train_steps, device, weights if it > 0 else None, weights, log=log)
+        train(eps, args.first_steps if it == 0 and args.first_steps else args.train_steps, device, weights if it > 0 else None, weights, log=log)
         del eps
         with mp.Pool(args.workers, initializer=_low_priority) as pool:
             ev = [r for r in pool.map(_eval_safe, [("agent", s) for s in range(HELD_OUT, HELD_OUT + args.eval_levels)], chunksize=1) if r is not None]
