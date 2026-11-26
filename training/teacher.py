@@ -23,6 +23,7 @@ from mapgen import CELL, KEY_FOR_LOCK, LOCKS  # noqa: E402
 
 KEY_VITAL = {"r": 10, "b": 8, "y": 9}  # vitals index of the card flag (red, blue, yellow)
 ENEMY_TYPES = (1, 2, 3)
+FIRE_WHILE_ALIGNING = __import__("os").environ.get("TEACHER_FIRE_ALIGN", "0") == "1"
 
 
 def _wrap(a: float) -> float:
@@ -216,6 +217,8 @@ class Teacher:
         if et[i] == 1 and dist < 130:
             return 22  # melee monster at arm's length: back off while shooting
         if abs(rel) > max(tol, 3.0):
+            if FIRE_WHILE_ALIGNING and dist < 400:
+                return 14 if rel > 0 else 15  # close enough that a slightly-off shot still lands
             return 7 if rel > 0 else 8  # fine aim by side-stepping (no shot wasted)
         if abs(rel) > tol:
             return 14 if rel > 0 else 15  # nearly on target: shoot while side-stepping into line
