@@ -45,7 +45,7 @@ def collect_episode(args) -> dict:
 
     rng = np.random.default_rng(seed)
     grid = Path(item["path"]).with_suffix(".txt").read_text()
-    env = make_env(item["path"], "MAP01", episode_ticks=item["ticks"], render_buffers=False)
+    env = make_env(item["path"], "MAP01", episode_ticks=item["ticks"], render_buffers=True)  # frames on: the door-colour filter reads them
     obs, _ = env.reset(seed=int(seed % (2**31)))
     teacher = Teacher(grid, np.random.default_rng(seed + 1))
     door_open = door_open_fn(env, grid)
