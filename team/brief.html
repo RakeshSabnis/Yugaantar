@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Can It Play DOOM? — Project Brief</title>
+<style>
+  @page { size: A4; margin: 11mm 13mm; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; font-size: 9.1pt; line-height: 1.3; color: #16202b; margin: 0; }
+  h1 { font-size: 17pt; margin: 0 0 1mm; color: #12305a; }
+  .sub { color: #51606f; margin: 0 0 3mm; font-size: 9pt; }
+  h2 { font-size: 11pt; color: #12305a; margin: 3.2mm 0 1.2mm; border-bottom: 1px solid #c9d4e2; padding-bottom: .6mm; }
+  p { margin: 0 0 1.6mm; }
+  ul { margin: 0 0 1.6mm; padding-left: 4.4mm; }
+  li { margin-bottom: .7mm; }
+  table { border-collapse: collapse; width: 100%; margin: 1mm 0 2mm; font-size: 8.7pt; }
+  th, td { border: 1px solid #c9d4e2; padding: 1mm 1.6mm; text-align: left; vertical-align: top; }
+  th { background: #e8eef7; color: #12305a; }
+  td.n, th.n { text-align: right; white-space: nowrap; }
+  .usp { background: #eef4fb; border-left: 3px solid #1f5fae; padding: 2mm 3mm; margin: 0 0 2mm; }
+  .flow { display: flex; align-items: stretch; gap: 1.2mm; margin: 1.5mm 0 2mm; font-size: 8.2pt; }
+  .box { flex: 1; border: 1px solid #9db3cf; border-radius: 1.4mm; padding: 1.2mm 1.4mm; background: #f6f9fd; text-align: center; }
+  .box b { display: block; color: #12305a; }
+  .arrow { align-self: center; color: #6b7d92; font-size: 11pt; }
+  .hl { background: #e3f3e6; border-color: #7fb98a; }
+  .page { page-break-after: always; }
+  code { font-family: Menlo, monospace; font-size: 8.3pt; }
+  .small { font-size: 8.3pt; color: #51606f; }
+</style>
+</head>
+<body>
+
+<div class="page">
+<h1>Can It Play DOOM? One map, three jobs</h1>
+<p class="sub">Yugaantar DevForge · Track 1 · Project brief · Scores below are from our own local scorer on held-out maps, not leaderboard scores.</p>
+
+<div class="usp">
+<b>USP.</b> The agent builds its own SLAM-style map of the level from nothing but its 64 rays and its own
+button presses, and that one map does three jobs: it is the <b>spatial memory</b>, it is the input to a
+<b>learned planner</b>, and it is the source of the <b>curiosity reward</b> that drives exploration. Every action comes
+from a 1.5M-parameter network that runs in about 1–4&nbsp;ms on one CPU thread and uses no GPU memory.
+</div>
+
+<h2>1. Rich spatial telemetry: sensory and state representation</h2>
+<p>We use the wrapper's rays, entity list and vitals and no pixels.</p>
+<ul>
+<li><b>Rays:</b> a circular 1D-CNN over the 64 rays (distance, near-ness, hit-type one-hot). Circular padding because the rays wrap around 360°.</li>
+<li><b>Entities:</b> a per-entity MLP with a type embedding, then masked attention pooling (two learned queries) plus max pooling, so any number of enemies, pickups and projectiles is handled.</li>
+<li><b>Vitals:</b> an MLP over normalised vitals and the agent's own previous action.</li>
+</ul>
+
+<h2>2. Bespoke architecture and spatial memory</h2>
+<div class="flow">
+  <div class="box"><b>Rays</b>circular CNN</div>
+  <div class="box"><b>Entities</b>attention pool</div>
+  <div class="box"><b>Vitals</b>MLP</div>
+  <div class="box hl"><b>Own SLAM map</b>fine 32×32 + wide 16×16</div>
+  <div class="arrow">→</div>
+  <div class="box"><b>GRU</b>256</div>
+  <div class="arrow">→</div>
+  <div class="box hl"><b>Which way?</b>16 directions</div>
+  <div class="arrow">→</div>
+  <div class="box"><b>Buttons</b>23 combos</div>
+</div>
+<p><b>The map (<code>submission/slam.py</code>).</b> The observations contain no position and no heading, so the agent
+estimates both. Heading comes from its own turn actions, using Doom's turn ramp, which we measured
+(7.03°, 12.30°, then 14.06° per step); it is exact on 99.8% of steps. Position integrates the observed
+ego-frame velocity with coefficients fitted against true motion (median drift about a quarter of a cell over
+a whole map). Each step the 64 rays are painted into an occupancy grid. The network reads two ego-centric
+views of it:</p>
+<table>
+<tr><th>Layer</th><th>What it records</th><th>Why it is there</th></tr>
+<tr><td>Free, wall, door, locked door</td><td>What the rays have seen; opened doors are removed</td><td>Remembers where the locked door was after it is out of sight</td></tr>
+<tr><td>Visited</td><td>Cells the agent has stood in</td><td>Tells explored space from seen space</td></tr>
+<tr><td>Frontier</td><td>Seen floor that borders never-seen cells</td><td>Makes "somewhere new" visible, even several rooms away in the wide view</td></tr>
+<tr><td>Holding a key</td><td>A plane set when any key flag is on</td><td>Lets the planner combine "I have a key" with "there is a locked door" in the same place</td></tr>
+<tr><td>Tried door</td><td>Locked doors where USE was pressed and the door stayed shut; cleared on a new key</td><td>The observations never give a lock's colour, so the agent must try, and must remember failures</td></tr>
+</table>
+<p><b>Learned planner.</b> A small convolution block is applied 8 times over the map (value-iteration style), so
+information spreads across it like a wavefront; its output around the agent feeds a <b>"which way to go"
+head</b> (16 directions or none), and the button head is conditioned on that prediction. This makes the
+policy <b>hierarchical</b>: direction first, buttons second. All of it is trained weights; there is no coded
+path search in the agent. Helper heads (the teacher's goal type; "locked door seen") shape what the GRU keeps.</p>
+<p class="small">Not learned in the submitted agent, and permitted by the rules: masking <code>USE</code> / weapon-switch on the step
+after a press (both are edge-triggered), observation preprocessing (encoding and the map), and a guard that
+returns a valid action on malformed input or any internal error.</p>
+
+<h2>3. Efficiency</h2>
+<table>
+<tr><th>Limit</th><th class="n">Allowed</th><th class="n">Ours</th></tr>
+<tr><td>Time per decision (one CPU thread)</td><td class="n">40 ms</td><td class="n">1–4 ms</td></tr>
+<tr><td>GPU memory</td><td class="n">2 GB</td><td class="n">0 (inference runs on CPU)</td></tr>
+<tr><td>Weights</td><td class="n">1 GB repository</td><td class="n">5.9 MB, 1.5M parameters</td></tr>
+</table>
+</div>
+
+<div>
+<h2>4. Training and exploration pipeline</h2>
+<p><b>Maps.</b> The organisers' test maps are UDMF drawn from ASCII grids; we decoded all 13 and wrote a
+generator in the same format for all four tiers (arenas, multi-room mazes with dead ends, keycard → lock →
+exit, two-lock gauntlets), each checked for solvability. 1,500 training maps; 180 held-out maps never trained
+on; 80 more from a different generator as a style check.</p>
+<p><b>Teacher, training only (<code>training/teacher.py</code>).</b> A scripted player with privileged engine state. It only
+acts on what it has seen so far (a line-of-sight mask and frontier exploration), so its behaviour can be
+copied from partial observations. It is never imported by <code>submission/</code>.</p>
+<p><b>Stage 1, imitation with DAgger.</b> The network plays, the teacher labels every state the network visits,
+and the data is aggregated across rounds, so the network learns to recover from its own mistakes. The
+"which way" head is trained on the direction of the teacher's next waypoint.</p>
+<p><b>Stage 2, reinforcement learning by self-imitation, in the same loop.</b> A value head regresses the
+discounted return. Where the action the agent itself took did <i>better</i> than the value expected, that action
+is reinforced (loss <code>−max(R − V, 0) · log π(a|s)</code>); worse-than-expected actions are not reinforced.</p>
+<table>
+<tr><th>Reward term</th><th>Source</th></tr>
+<tr><td>Exit (with a time bonus), keys, doors, locked doors, kills; minus damage, death and a small per-step cost</td><td>Shaped to mirror the scoring categories (privileged state, training only)</td></tr>
+<tr><td><b>Curiosity:</b> a bonus for entering a cell of the agent's own SLAM map it has never stood in</td><td><b>Intrinsic:</b> computed from the agent's own memory</td></tr>
+</table>
+<p><b>Also built and tested, not in the submitted weights.</b> (1) A signed-advantage actor-critic term and a
+<b>learned curiosity module</b> (random network distillation over the observation and the wide map view,
+<code>training/rnd.py</code>): stable, but had not beaten the submitted agent on both seed sets by the deadline.
+(2) Our own recurrent PPO (<code>training/ppo.py</code>): lowered the score in four configurations, the last with a trained
+critic (860 → 628). The cause: this agent is only stable when trained on a large accumulated pool of games, and
+PPO trains on small fresh batches. That is why the RL that works here lives inside the pooled loop.</p>
+
+<h2>5. Results (our scorer, held-out maps)</h2>
+<table>
+<tr><th>Policy</th><th class="n">180 held-out maps</th><th class="n">80 maps, other generator</th></tr>
+<tr><td>Random</td><td class="n">about −50</td><td class="n">—</td></tr>
+<tr><td>Imitation only, with the SLAM map (no planner)</td><td class="n">about 650</td><td class="n">—</td></tr>
+<tr><td>+ SLAM map, planner, direction head</td><td class="n">825 / 790 (two seed sets)</td><td class="n">973</td></tr>
+<tr><td><b>+ self-imitation RL, curiosity, key-aware map (submitted)</b></td><td class="n"><b>860 / 762 (two seed sets)</b></td><td class="n"><b>971</b></td></tr>
+<tr><td>Teacher (privileged, training only)</td><td class="n">about 1,300 (60 maps)</td><td class="n">—</td></tr>
+</table>
+<p>Per tier for the submitted agent (exit rate): combat 33–60%, exploration 42–65%, keycard 51–71%, gauntlet 9–15%. The range is across the three test sets.</p>
+<p><b>Diagnosis-driven work.</b> We ran teacher and agent through all 45 held-out gauntlet maps and logged the
+stage each run reached. The agent's main failure was specific: in 15 of 45 runs it picked up a key and then
+never opened a lock, and it kept returning to doors it could not open. That produced the "holding a key" and
+"tried door" map layers. After them, second locks opened twice as often (4 → 8 of 45).</p>
+
+<h2>6. Limitations, stated plainly</h2>
+<ul>
+<li><b>Gauntlets remain hard:</b> about one run in ten reaches the exit; the teacher manages about six in ten and needs 780 of the 1,050 steps itself.</li>
+<li><b>Most of the skill comes from imitation.</b> The RL stage is real and in the weights, but conservative: it tied the imitation-only agent on score, and at equal score we chose the agent that includes it.</li>
+<li><b>The agent still wastes time at locked doors</b> it cannot open; the tried-door memory is only partly learned.</li>
+<li><b>Our scorer is an estimate</b> of the official one, and scores move by about ±40 between seed sets, so we only trust differences that hold on two seed sets and on maps from a second generator.</li>
+<li><b>Map-style risk:</b> if hidden maps are not grid-style, the map memory is less precise. On 80 maps with other cell sizes and random start directions the agent held its score.</li>
+</ul>
+<p class="small"><b>With more time:</b> longer RL with a properly trained value function, a learned (network-based) curiosity signal
+alongside the map-based one, and training on community WADs. Code, training logs of what worked and what did
+not, and the failure-analysis tool are in the repository (<code>training/</code>, <code>team/WORKLOG.md</code>).</p>
+</div>
+
+</body>
+</html>
