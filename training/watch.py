@@ -122,7 +122,10 @@ def main():
         wad, _, mapname = a.map.partition(":")
         mapname = mapname or "MAP01"
         ticks = 4200
-    print(f"map {wad}:{mapname}")
+    TIER_NAMES = {"t1": "Tier 1: combat", "t2": "Tier 2: exploration", "t3": "Tier 3: keycard", "t4": "Tier 4: gauntlet"}
+    stem = Path(wad).stem
+    level = f"{TIER_NAMES.get(stem[:2], 'Level')}  |  {stem if mapname == 'MAP01' else stem + ':' + mapname}"
+    print(f"map {wad}:{mapname}  ({level})")
     grid_path = Path(wad).with_suffix(".txt")
     if grid_path.exists():
         print(grid_path.read_text())
@@ -161,7 +164,7 @@ def main():
             if view is not None:
                 v = obs["vitals"]
                 keys = "".join(c for c, i in (("B", 8), ("Y", 9), ("R", 10)) if v[i] > 0 or v[i + 3] > 0)
-                if not view.draw(slam, f"step {k}  health {int(v[0])}  ammo {int(v[3])}  keys {keys or '-'}", obs.get("rgb")):
+                if not view.draw(slam, f"{level}   |   step {k}/{ticks // 4}  health {int(v[0])}  ammo {int(v[3])}  keys {keys or '-'}  kills {int(env.privileged_state()['kills'])}", obs.get("rgb")):
                     view = None
             if term or trunc:
                 break
