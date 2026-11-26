@@ -41,7 +41,7 @@ def collect_episode(args) -> dict:
     from model import Perception, Policy
     from model import OBS_DIM
     from scorer import Tracker
-    from teacher import Teacher, door_open_fn
+    from teacher import Teacher, dir_bin, door_open_fn
 
     rng = np.random.default_rng(seed)
     grid = Path(item["path"]).with_suffix(".txt").read_text()
@@ -57,14 +57,14 @@ def collect_episode(args) -> dict:
         h = model.initial_state(1)
     tracker = Tracker(env.privileged_state())
     perception = Perception()
-    X, M, PA, Y, G, L = [], [], [], [], [], []
+    X, M, PA, Y, G, L, D = [], [], [], [], [], [], []
     prev, locked_seen = 0, 0
     while True:
         priv = env.privileged_state()
         label = teacher.act(obs, priv, door_open)
         x = perception.see(obs)
         locked_seen = int(locked_seen or bool(np.any(obs["rays"]["hit_type"] == 3)))
-        X.append(x[:OBS_DIM].astype(np.float16)); M.append(x[OBS_DIM:].astype(np.uint8)); PA.append(prev); Y.append(label); G.append(GOAL_ID.get(teacher.goal_kind, 0)); L.append(locked_seen)
+        X.append(x[:OBS_DIM].astype(np.float16)); M.append(x[OBS_DIM:].astype(np.uint8)); PA.append(prev); Y.append(label); G.append(GOAL_ID.get(teacher.goal_kind, 0)); L.append(locked_seen); D.append(dir_bin(teacher.dir_rel))
         a = label
         if model is not None:
             logits, _, h = model.step(torch.from_numpy(x).unsqueeze(0), torch.tensor([prev]), h)
@@ -90,7 +90,7 @@ def collect_episode(args) -> dict:
     env.close()
     res = tracker.result(Path(item["path"]).name, item["tier"]).as_dict()
     return {"x": np.stack(X), "m": np.stack(M), "pa": np.array(PA, np.int16), "y": np.array(Y, np.int16), "g": np.array(G, np.int8),
-            "l": np.array(L, np.int8), "result": res}
+            "l": np.array(L, np.int8), "d": np.array(D, np.int8), "result": res}
 
 
 def collect(items, weights, beta, workers, seed0, temperature=0.5):
@@ -109,7 +109,7 @@ def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=prin
     model.train()
     for ep in range(epochs):
         order = np.random.permutation(len(episodes))
-        tot, n, correct = 0.0, 0, 0
+        tot, n, correct, dcorrect = 0.0, 0, 0, 0.0
         t0 = time.time()
         for b0 in range(0, len(order), batch):
             eps = [episodes[i] for i in order[b0:b0 + batch]]
@@ -119,32 +119,35 @@ def train(model, episodes, epochs, device, lr=3e-4, batch=64, chunk=64, log=prin
             pa = np.zeros((B, T), np.int64)
             y = np.zeros((B, T), np.int64)
             g = np.zeros((B, T), np.int64)
+            dd = np.zeros((B, T), np.int64)
             lk = np.zeros((B, T), np.float32)
             m = np.zeros((B, T), np.float32)
             for i, e in enumerate(eps):
                 k = len(e["y"])
-                x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; y[i, :k] = e["y"]; g[i, :k] = e["g"]; lk[i, :k] = e["l"]; m[i, :k] = 1
-            x, pa, y, g, lk, m = (torch.from_numpy(a).to(device) for a in (x, pa, y, g, lk, m))
+                x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; y[i, :k] = e["y"]; g[i, :k] = e["g"]; dd[i, :k] = e["d"]; lk[i, :k] = e["l"]; m[i, :k] = 1
+            x, pa, y, g, dd, lk, m = (torch.from_numpy(a).to(device) for a in (x, pa, y, g, dd, lk, m))
             h = model.initial_state(B, device)
             for t0c in range(0, T, chunk):
                 sl = slice(t0c, t0c + chunk)
                 mm = m[:, sl]
                 if mm.sum() == 0:
                     break
-                logits, _, (ag, al), h = model(x[:, sl], pa[:, sl], h)
+                logits, _, (ag, al, ad), h = model(x[:, sl], pa[:, sl], h)
                 h = h.detach()
                 ce = Fn.cross_entropy(logits.reshape(-1, logits.shape[-1]), y[:, sl].reshape(-1), reduction="none", label_smoothing=0.05)
                 ceg = Fn.cross_entropy(ag.reshape(-1, ag.shape[-1]), g[:, sl].reshape(-1), reduction="none")
                 bce = Fn.binary_cross_entropy_with_logits(al.reshape(-1), lk[:, sl].reshape(-1), reduction="none")
                 mf = mm.reshape(-1)
-                loss = ((ce + 0.2 * ceg + 0.2 * bce) * mf).sum() / mf.sum()
+                ced = Fn.cross_entropy(ad.reshape(-1, ad.shape[-1]), dd[:, sl].reshape(-1), reduction="none")
+                loss = ((ce + 0.2 * ceg + 0.2 * bce + 0.5 * ced) * mf).sum() / mf.sum()
+                dcorrect += float(((ad.argmax(-1) == dd[:, sl]).float() * mm).sum())
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 tot += float(loss.detach()) * float(mf.sum()); n += float(mf.sum())
                 correct += float(((logits.argmax(-1) == y[:, sl]).float() * mm).sum())
-        log(f"  epoch {ep}: loss {tot / n:.3f}  acc {correct / n:.3f}  ({time.time() - t0:.0f}s)")
+        log(f"  epoch {ep}: loss {tot / n:.3f}  acc {correct / n:.3f}  dir-acc {dcorrect / n:.3f}  ({time.time() - t0:.0f}s)")
 
 
 def main():
