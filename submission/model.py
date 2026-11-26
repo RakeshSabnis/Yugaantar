@@ -24,6 +24,9 @@ ENT_FEAT = 5
 ENT_TYPES = 12
 VITALS = 17
 AUX_GOALS = 5  # teacher goal kind: none, exit, key, frontier, revisit
+DIRS = 17      # which way to go: 16 ego-centric direction bins (22.5 deg each) + 'no navigation target'
+PLAN_ITERS = 8
+PLAN_CH = 10
 
 # Flat feature layout (float32), produced by encode_obs and consumed by Policy.
 RAY_DIM = NUM_RAYS * (1 + RAY_TYPES)
@@ -143,7 +146,16 @@ class Policy(nn.Module):
         self.wide_fc = nn.Linear(32 * 16, 64)
         self.fuse = nn.Sequential(nn.Linear(256 + 64 * 3 + 64 + 128 + 64, hidden), nn.ReLU())
         self.gru = nn.GRU(hidden, hidden, batch_first=True)
-        self.pi = nn.Sequential(nn.Linear(hidden * 2, 256), nn.ReLU(), nn.Linear(256, NUM_ACTIONS))
+        # Learned planner (value-iteration style): one small conv block applied PLAN_ITERS times over the
+        # fine map, so information (frontiers, doors, walls) spreads across the map like a wavefront.
+        # All weights are trained; there is no coded path search.
+        self.plan_in = nn.Conv2d(MAP_CH, PLAN_CH, 3, stride=2, padding=1)   # 32x32 -> 16x16
+        self.plan_it = nn.Conv2d(2 * PLAN_CH, PLAN_CH, 3, padding=1)
+        self.plan_fc = nn.Linear(PLAN_CH * 8 * 8, 64)
+        # "Which way to go" head (hierarchical policy): predicts the direction of the next waypoint;
+        # the button head is conditioned on this prediction.
+        self.dir_head = nn.Sequential(nn.Linear(hidden + 64, 128), nn.ReLU(), nn.Linear(128, DIRS))
+        self.pi = nn.Sequential(nn.Linear(hidden * 2 + 64 + DIRS, 256), nn.ReLU(), nn.Linear(256, NUM_ACTIONS))
         self.v = nn.Sequential(nn.Linear(hidden * 2, 256), nn.ReLU(), nn.Linear(256, 1))
         self.aux_goal = nn.Linear(hidden, AUX_GOALS)       # what the teacher is heading for
         self.aux_locked = nn.Linear(hidden, 1)              # has a locked door been seen this episode?
@@ -178,16 +190,25 @@ class Policy(nn.Module):
         wp = x[:, OBS_DIM + MAP_DIM:OBS_DIM + MAP_DIM + WIDE_DIM].round().long().view(n, WIDE, WIDE)
         wbits = torch.stack([(wp >> b) & 1 for b in range(WIDE_CH)], dim=1).float()
         wfeat = Fn.relu(self.wide_fc(self.wide_conv(wbits).flatten(1)))
-        return self.fuse(torch.cat([r, pooled, mx, v, mfeat, wfeat], dim=-1))
+        p0 = Fn.relu(self.plan_in(bits))
+        ph = p0
+        for _ in range(PLAN_ITERS):
+            ph = Fn.relu(self.plan_it(torch.cat([ph, p0], dim=1)))
+        c = MAP // 4
+        pfeat = Fn.relu(self.plan_fc(ph[:, :, c - 4:c + 4, c - 4:c + 4].flatten(1)))  # read out around the agent
+        return self.fuse(torch.cat([r, pooled, mx, v, mfeat, wfeat], dim=-1)), pfeat
 
     def forward(self, x, prev_action, h0):
         """x: (B, T, FULL_DIM), prev_action: (B, T), h0: (1, B, H) -> logits (B,T,A), value (B,T), aux, hT."""
         b, t, _ = x.shape
-        z = self.encode(x.reshape(b * t, -1), prev_action.reshape(b * t)).view(b, t, -1)
+        z, pf = self.encode(x.reshape(b * t, -1), prev_action.reshape(b * t))
+        z, pf = z.view(b, t, -1), pf.view(b, t, -1)
         out, hT = self.gru(z, h0)
         feat = torch.cat([out, z], dim=-1)
+        dlog = self.dir_head(torch.cat([out, pf], dim=-1))
+        pin = torch.cat([feat, pf, torch.softmax(dlog, -1).detach()], dim=-1)
         vfeat = feat.detach() if getattr(self, "detach_value", False) else feat  # RL warm-up: value must not disturb the policy
-        return self.pi(feat), self.v(vfeat).squeeze(-1), (self.aux_goal(out), self.aux_locked(out).squeeze(-1)), hT
+        return self.pi(pin), self.v(vfeat).squeeze(-1), (self.aux_goal(out), self.aux_locked(out).squeeze(-1), dlog), hT
 
     @torch.no_grad()
     def step(self, x: torch.Tensor, prev_action: torch.Tensor, h: torch.Tensor):

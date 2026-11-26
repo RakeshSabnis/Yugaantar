@@ -48,6 +48,7 @@ class Teacher:
         self.door_wait = 0
         self.goal = None
         self.goal_kind = ""
+        self.dir_rel = None
         self.t = 0
         self.blocked: dict[tuple[int, int], int] = {}  # door cells that would not open -> retry after step
 
@@ -125,6 +126,7 @@ class Teacher:
             self.stuck_steps = 0
         self.last_pos = (x, y)
 
+        self.dir_rel = None  # ego-centric direction (degrees, + = left) of the current waypoint, if navigating
         action = self._decide(obs, x, y, ang, cell, keys, door_open)
         if USE in COMBOS[action] and self.prev_use:
             action = from_buttons([1 if i == F else 0 for i in range(9)]) if F in COMBOS[action] else 0
@@ -185,37 +187,41 @@ class Teacher:
         if dodge is not None:
             return dodge
         ents = obs["visible_entities"]
-        best = None
-        for k in range(len(ents["mask"])):
-            if not ents["mask"][k] or ents["entity_type"][k] not in ENEMY_TYPES:
-                continue
-            d, s, c = ents["features"][k][:3]
-            if d * 1024 > 1100:
-                continue
-            best = (d, math.degrees(math.atan2(s, c)))
-            break  # sorted nearest first
-        if best is None:
+        et = np.asarray(ents["entity_type"])
+        feat = np.asarray(ents["features"])
+        enemy = (np.asarray(ents["mask"]) > 0) & (et >= 1) & (et <= 3)
+        has_ammo = obs["vitals"][3] > 0
+        if not enemy.any() or not has_ammo:
             # enemy seen by rays but outside the field of view: turn toward it if close
             hits = np.flatnonzero((obs["rays"]["hit_type"] == 4) & (obs["rays"]["distance"] < 0.45))
-            if len(hits):
+            if len(hits) and has_ammo:
                 k = int(hits[np.argmin(obs["rays"]["distance"][hits])])
-                rel = _wrap(k * 360.0 / 64)
-                return 4 if rel > 0 else 5
+                return 4 if k < 32 else 5
             return None
-        d, rel = best
-        dist = d * 1024
-        tol = max(3.0, math.degrees(math.atan2(18.0, max(dist, 1.0))))
+        idx = np.flatnonzero(enemy)  # sorted nearest first
+        near = [k for k in idx if feat[k, 0] * 1024.0 < 160.0]
+        hitscan = [k for k in idx if et[k] == 2]
+        i = int((near or hitscan or list(idx))[0])  # point-blank threat, else hitscanners, else nearest
+        dist = float(feat[i, 0]) * 1024.0
+        rel = math.degrees(math.atan2(float(feat[i, 1]), float(feat[i, 2])))
+        if not (dist < 900.0 or (dist < 1400.0 and et[i] != 1)):
+            return None
+        tol = math.degrees(math.atan2(18.0, max(dist, 1.0))) + 1.5
+        if abs(rel) > 7.5:  # coarse: the smallest turn is ~7 degrees
+            return 4 if rel > 0 else 5
         self.strafe_timer -= 1
         if self.strafe_timer <= 0:
             self.strafe_dir = -self.strafe_dir
-            self.strafe_timer = int(self.rng.integers(6, 14))
-        if rel > tol:
-            return 12  # attack + turn left
-        if rel < -tol:
-            return 13
-        if dist < 160:
-            return 22  # too close (melee): back off while shooting
-        return 14 if self.strafe_dir > 0 else 15
+            self.strafe_timer = int(self.rng.integers(8, 16))
+        if et[i] == 1 and dist < 130:
+            return 22  # melee monster at arm's length: back off while shooting
+        if abs(rel) > max(tol, 3.0):
+            return 7 if rel > 0 else 8  # fine aim by side-stepping (no shot wasted)
+        if abs(rel) > tol:
+            return 14 if rel > 0 else 15  # nearly on target: shoot while side-stepping into line
+        if dist > 150 and et[i] != 1:
+            return 14 if self.strafe_dir > 0 else 15  # on target: shoot and dodge
+        return 11
 
     def _plan(self, cell, keys):
         g = self.at
@@ -261,7 +267,7 @@ class Teacher:
         if self.at(*p) in "DRBY" and not door_open(*p):
             tx, ty = self.center(*p)
             dist = math.hypot(tx - x, ty - y)
-            rel = _wrap(math.degrees(math.atan2(ty - y, tx - x)) - ang)
+            rel = self.dir_rel = _wrap(math.degrees(math.atan2(ty - y, tx - x)) - ang)
             if abs(rel) > 12:
                 return 4 if rel > 0 else 5
             if dist > 70:
@@ -280,7 +286,7 @@ class Teacher:
         if any(self.at(*q) in "DRBY" and not door_open(*q) for q in path[1:path.index(target) + 1]):
             target = path[1]
         tx, ty = self.center(*target)
-        rel = _wrap(math.degrees(math.atan2(ty - y, tx - x)) - ang)
+        rel = self.dir_rel = _wrap(math.degrees(math.atan2(ty - y, tx - x)) - ang)
         if rel > 25:
             return 4 if abs(rel) > 60 else 2
         if rel < -25:
@@ -304,6 +310,13 @@ class Teacher:
             if self.at(r, c) in "#DRBY":
                 return False
         return True
+
+
+def dir_bin(rel) -> int:
+    """Direction label: 0..15 = 22.5-degree bins (bin 0 = straight ahead, counter-clockwise), 16 = none."""
+    if rel is None:
+        return 16
+    return int(((rel % 360.0) + 11.25) // 22.5) % 16
 
 
 def door_open_fn(env, grid_text: str):
