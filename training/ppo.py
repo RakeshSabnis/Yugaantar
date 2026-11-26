@@ -140,9 +140,11 @@ def main():
     ap.add_argument("--bc", type=float, default=0.5, help="initial weight of the teacher cross-entropy term")
     ap.add_argument("--bc-decay", type=float, default=0.985)
     ap.add_argument("--bc-min", type=float, default=0.15, help="the teacher term never fades below this")
-    ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--temperature", type=float, default=0.5, help="sampling temperature of the rollouts (same as the agent at evaluation)")
     ap.add_argument("--eval-every", type=int, default=10)
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--pg-coef", type=float, default=1.0, help="weight of the policy-gradient term relative to the teacher term")
+    ap.add_argument("--separate-value", action="store_true", help="value gradients never reach the shared layers")
     ap.add_argument("--value-warmup", type=int, default=15, help="iterations where value gradients don't reach the shared layers")
     a = ap.parse_args()
 
@@ -186,7 +188,7 @@ def main():
     ret_rms = 1.0
     for it in range(1, a.iters + 1):
         t0 = time.time()
-        model.detach_value = it <= a.value_warmup
+        model.detach_value = a.separate_value or it <= a.value_warmup
         chosen = [items[i] for i in rng.choice(len(items), size=a.episodes, replace=False)]
         eps = pool.map(rollout, [(c, str(out / "last.pt"), int(rng.integers(1 << 30)), a.temperature) for c in chosen], chunksize=1)
         t_col = time.time() - t0
@@ -201,9 +203,16 @@ def main():
             k = len(e["a"])
             x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; act[i, :k] = e["a"]; lp_old[i, :k] = e["lp"]; rew[i, :k] = e["r"]; y[i, :k] = e["y"]; dd[i, :k] = e["d"]; ww[i, :k] = e["w"]; m[i, :k] = 1
         tx, tpa, tact, tlp, ty, tm, tdd, tww = (torch.from_numpy(v).to(dev) for v in (x, pa, act, lp_old, y, m, dd, ww))
-        with torch.no_grad():
-            _, values, _, _ = model(tx, tpa, model.initial_state(B, dev))
-        values = values.float().cpu().numpy() * m
+        vals = []
+        with torch.no_grad():  # in slices (episodes x time) so the GPU never holds the whole batch at once
+            for b0 in range(0, B, 16):
+                hv = model.initial_state(min(16, B - b0), dev)
+                row = []
+                for c0 in range(0, T, 128):
+                    _, vv, _, hv = model(tx[b0:b0 + 16, c0:c0 + 128], tpa[b0:b0 + 16, c0:c0 + 128], hv)
+                    row.append(vv.float().cpu())
+                vals.append(torch.cat(row, dim=1))
+        values = torch.cat(vals, dim=0).numpy() * m
         # reward scaling by a running estimate of return std
         ret_rms = 0.95 * ret_rms + 0.05 * float(np.std(rew[m > 0]) * math.sqrt(1.0 / (1 - a.gamma)) + 1e-3)
         scale = 1.0 / max(ret_rms, 1e-3)
@@ -238,22 +247,24 @@ def main():
                         break
                     logits, v, aux, h = model(tx[idx_t, sl], tpa[idx_t, sl], h)
                     h = h.detach()
-                    logits = masked_logits(logits, tpa[idx_t, sl], use_ids, nextw_ids) / a.temperature
-                    logp_all = torch.log_softmax(logits, -1)
+                    raw = masked_logits(logits, tpa[idx_t, sl], use_ids, nextw_ids)
+                    logp_all = torch.log_softmax(raw / a.temperature, -1)  # the distribution the games were played with
                     lp = logp_all.gather(-1, tact[idx_t, sl].unsqueeze(-1)).squeeze(-1)
                     ratio = torch.exp(lp - tlp[idx_t, sl])
                     ad = tadv[idx_t, sl]
                     pl = -torch.min(ratio * ad, ratio.clamp(1 - a.clip, 1 + a.clip) * ad)
                     vl = (v - tret[idx_t, sl]) ** 2
                     ent = -(logp_all.exp() * logp_all).sum(-1)
-                    bcl = Fn.cross_entropy(logits.reshape(-1, logits.shape[-1]), ty[idx_t, sl].reshape(-1), reduction="none").view_as(lp)
+                    # teacher term on the RAW logits, exactly as in imitation training (no temperature), so RL
+                    # cannot flatten or sharpen the policy relative to what imitation learned
+                    bcl = Fn.cross_entropy(logits.reshape(-1, logits.shape[-1]), ty[idx_t, sl].reshape(-1), reduction="none", label_smoothing=0.05).view_as(lp)
                     # keep the 'which way to go' head trained on the teacher's waypoint direction
                     bcl = bcl + 0.5 * Fn.cross_entropy(aux[2].reshape(-1, aux[2].shape[-1]), tdd[idx_t, sl].reshape(-1), reduction="none").view_as(lp)
                     # one optimizer step per minibatch: accumulate gradients over all chunks
                     # warm-up: learn the value function only, leave the policy untouched
                     bcl = bcl * tww[idx_t, sl]
                     pw = 0.0 if it <= a.value_warmup else 1.0
-                    loss = ((pw * (pl - a.ent * ent + bc * bcl) + 0.5 * vl) * mm).sum() / n_tot
+                    loss = ((pw * (a.pg_coef * pl - a.ent * ent + bc * bcl) + 0.5 * vl) * mm).sum() / n_tot
                     loss.backward()
                     stats.append([float((pl.detach() * mm).sum() / mm.sum()), float((vl.detach() * mm).sum() / mm.sum()), float((ent.detach() * mm).sum() / mm.sum()),
                                   float((bcl.detach() * mm).sum() / mm.sum()), float((((ratio.detach() - 1).abs() > a.clip).float() * mm).sum() / mm.sum())])
