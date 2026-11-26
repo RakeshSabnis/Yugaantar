@@ -10,15 +10,16 @@ compare our own checkpoints with each other; they are not leaderboard scores.
 - The weighted score is: tier-1 average + 1.5 × tier-2 + 2 × tier-3 + 3 × tier-4 (per-map averages).
 - A single map tops out at roughly 140–270 points, so a perfect weighted score would be about 1,645.
 
-## Current state (updated 00:05)
+## Current state (updated 01:35)
 
 | | |
 |---|---|
-| Submitted agent (branch `yash`) | Planner network trained with imitation + self-imitation RL + curiosity, round 3 |
+| Submitted agent (branch `yash`) | Planner network trained with imitation + self-imitation RL + map curiosity, round 3 |
 | Its score, 180 maps | 860 and 762 on two seed sets (previous agent: 825 and 790) |
 | Its score, 80 maps from `main`'s generator | 971 (previous agent: 973) |
 | `main` branch agent (20:25 weights) | 475 on our 180 maps, 561 on its own generator's 80 maps |
-| Running | Further rounds of the same run, until about 01:00 |
+| Brief | `team/Project_Brief_Track1.pdf` (2 pages) |
+| Running | Last run: actor-critic term, learned curiosity, blocked/stuck penalties. 760 → 728 → 799 so far |
 
 ---
 
@@ -149,6 +150,22 @@ less (0–15% vs 10–25% on its own maps) and gets stuck less (4–6% of steps 
 Lesson: one score on one seed set is not enough to pick a checkpoint. The same agent moves by about ±40
 between seed sets.
 
+### 00:05–01:35 · "A more proper RL", late fixes, brief
+
+| Tried | Result | Kept? |
+|---|---|---|
+| Further rounds of the imitation + self-imitation run | 805, 759 after the 860 round: a plateau around 780 | Stopped |
+| **PPO with a trained critic** (value head from the previous rounds), map curiosity and a learned curiosity module (random network distillation) | Critic error 0.07 from the start (earlier PPO runs: about 1.0), yet 860 → 628 after six policy updates | **No.** Fourth PPO failure |
+| Why PPO fails here | Not the RL signal or the critic. Every PPO run trains on a small fresh batch and discards it; the imitation runs show the same dip whenever they restart with an empty pool. This agent is only stable on a large accumulated pool of games | Lesson kept |
+| **Actor-critic term inside the pooled loop** (signed advantage on each round's own games) + **learned curiosity (RND)** added to the reward | Runs stably | In the last run |
+| Penalty for standing at a locked door the agent cannot open, penalty for not moving, reward for newly *seen* map cells, 3× teacher weight where the agent is stuck or blocked | Stuck time 8–14% in the first round (submitted agent 9–22%) | In the last run |
+| Teacher taps fire at range (organisers' note on pistol spread) | 2,329 vs 2,426 over 180 maps | **No**, left off |
+| Organisers' checklist (weights via LFS, limits, self-contained `submission/`, public repo, validator) | All pass | — |
+| 2-page brief | Written, exported with the browser's print-to-PDF, checked at 2 pages | Yes |
+
+Per-tier picture of the submitted agent across the three test sets (exit rate): combat 33–60%,
+exploration 42–65%, keycard 51–71%, gauntlet 9–15%.
+
 ---
 
 ## What we are going ahead with
@@ -156,13 +173,15 @@ between seed sets.
 - **Architecture:** ray CNN, entity attention, SLAM map (fine + wide views), learned planner, direction
   head → button head, GRU.
 - **Training:** DAgger imitation from a training-only teacher, with a self-imitation RL term on a shaped
-  reward plus a map-based curiosity bonus.
+  reward plus a map-based curiosity bonus. The actor-critic term and the learned curiosity module are in
+  the code and in the last run; they are in the weights only if that run beats the submitted agent.
 - **Selection rule:** a checkpoint replaces the submission only if it beats the current one on all 180
   held-out maps, and the validator passes.
 
 ## Things that did not work (short list)
 
-- PPO fine-tuning, three configurations: always lowered the score. (Self-imitation RL, tried later, did not.)
+- PPO fine-tuning, four configurations including one with a trained critic: always lowered the score.
+  (Self-imitation RL inside the pooled loop did not.)
 - Scan matching for heading: much worse than the action-based turn model.
 - Teacher detours for health and shotgun: slightly worse.
 - Weight averaging of consecutive rounds: worse than the better round.
