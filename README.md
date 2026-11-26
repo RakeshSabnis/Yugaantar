@@ -6,6 +6,36 @@ looks for the exit. Built from the official `devforge-doom-template` during the 
 Every action comes from the trained network in `submission/`. There is no scripted decision logic,
 pathfinding or aim maths in the submitted agent.
 
+## Quick start
+
+Requires Python 3.13 and [uv](https://docs.astral.sh/uv/). Weights are stored with Git LFS
+(`git lfs install` once, before cloning).
+
+```bash
+uv sync --group train                                        # install the official environment and PyTorch
+uv run python validate.py                                    # the organisers' validator: must print PASSED
+uv run python training/watch.py --map maps/two_rooms.wad     # watch the agent play, with its map
+```
+
+`watch.py` opens two windows: the game from the agent's eyes, and the map it is building as it
+explores. To watch it on generated levels of every tier:
+
+```bash
+uv run python training/make_maps.py                          # generate training and held-out levels (once)
+uv run python training/watch.py                              # a random held-out level each time
+uv run python training/watch.py --policy teacher             # the training-only teacher, for comparison
+```
+
+Useful options: `--speed 2` plays twice as fast, `--no-map` hides the map window.
+
+| I want to... | Go to |
+| --- | --- |
+| see what is evaluated | `submission/agent.py` |
+| understand the network | `submission/model.py`, and "The agent" below |
+| understand the map memory | `submission/slam.py` |
+| see how it was trained | `training/README.md` |
+| read the 2-page brief | `docs/brief.pdf` |
+
 ## Approach in one paragraph
 
 Pure reinforcement learning rarely discovers keycard → locked door → exit in a few hours. We first train
@@ -45,30 +75,23 @@ agent picks up the key in 95% of tier 3 levels and opens the locked door in 81%,
 and 1.4 locked doors per tier 4 level. Our local score rose from 1083 to **1198** with the three
 additions described below, using the same network weights.
 
-The figures quoted inside the next two sections were measured on the previous weights.
-
 ## Door colours from the frame
 
-The rays report "locked door" but not which key it needs, so an agent with one key wastes time at
-doors it cannot open. `submission/slam.py` reads each locked door's colour (red, blue or yellow
+The rays report "locked door" but not which key it needs, so an agent holding one key can waste time
+at doors it cannot open. `submission/slam.py` reads each locked door's colour (red, blue or yellow
 grille) from the frame, using the depth buffer to pick the pixels that belong to that door. Until
-the agent holds the matching key, that door is shown to the network as a wall, in both its rays and
-its map; it turns back into a locked door when the key is picked up. This is observation
-preprocessing only. On 192 held-out levels with the same weights it raised the local score from
-1073 to 1108 (tier 3 exits 42% -> 50%, tier 4 12% -> 15%; tiers without locks unchanged).
+the agent holds the matching key, that door appears in its rays and its map as a wall; it turns back
+into a locked door when the key is picked up.
 
-## Exit pads from the frame, and a mask for jams
-
-Two more pieces of preprocessing and masking, both measured on the same 192 held-out levels with the
-same weights (local score 1108 -> 1141; exits on tiers 1-3 from 65/67/50% to 75/71/58%):
+## Exit pads from the frame, and jam recovery
 
 - **Exit pads.** Neither rays nor entities show the exit. `submission/slam.py` finds the exit pad's red
-  floor in the frame, places it with the depth buffer, and presents those map cells to the network as
-  frontier, which it has learned to walk towards. Upright red things (blood, corpses, fireballs) are
-  rejected because their pixels share one depth, and frames tinted by damage are skipped.
-- **Jam mask.** If the agent has pressed forward for several steps without moving and is not waiting
-  at a door, forward is withheld for a few steps, so the network's own next choice (side-step, turn,
-  back) frees it. This is action masking from observation fields; the network still chooses.
+  floor in the frame, places it with the depth buffer, and writes those cells into the map as a place
+  worth walking to. Upright red things (blood, corpses, fireballs) are rejected because their pixels
+  share one depth, and frames tinted by damage are skipped.
+- **Jam recovery.** Doors are 64 units wide and the player 32. If the agent has pressed forward for
+  several steps without moving and is not waiting at a door, forward is withheld for a few steps and
+  the network's next choice (side-step, turn, back) frees it.
 
 ## Repository layout
 
@@ -109,21 +132,19 @@ docs/*.md, env/, tests/, maps/, validate.py, Dockerfile, docker/    the official
 About 1.5M parameters; about 1–4 ms per decision on one CPU thread (limit: 40 ms). Inference always
 runs on CPU.
 
-## Reproduce
-
-Requires Python 3.13 and [uv](https://docs.astral.sh/uv/).
+## Train it yourself
 
 ```bash
-uv sync --group train                              # official env + PyTorch
-uv run python validate.py                          # official validator
-
-uv run python training/make_maps.py                # training maps + held-out maps
-uv run python training/evaluate.py --policy teacher                # score the teacher
-uv run python training/dagger.py --rounds 8 --device mps           # imitation (use --device cpu or cuda elsewhere)
-uv run python training/publish.py runs/dagger/best.pt              # copy weights into submission/
-uv run python training/watch.py                                    # watch the submitted agent
-uv run python training/watch.py --live                             # follow the newest training checkpoint
+uv run python training/make_maps.py                            # training and held-out levels
+uv run python training/evaluate.py --policy teacher            # score the teacher on held-out levels
+uv run python training/dagger.py --rounds 8 --device cpu       # train (cpu, cuda or mps)
+uv run python training/publish.py runs/dagger/best.pt          # copy the best checkpoint into submission/
+uv run python training/evaluate.py --policy agent              # score the trained agent
+uv run python training/diagnose.py --tier 4 --policy agent     # where do runs on a tier break down?
+uv run python training/watch.py --live                         # follow the newest checkpoint while training
 ```
+
+Each stage is explained in `training/README.md`.
 
 ## Rules compliance
 
