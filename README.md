@@ -1,4 +1,4 @@
-# Can It Play DOOM? — Yugaantar DevForge, Track 1
+# Can It Play DOOM? — Team TriTokens · Yugaantar DevForge, Track 1
 
 A neural agent that plays unseen DOOM levels: it explores, fights, finds keycards, opens locked doors and
 looks for the exit. Built from the official `devforge-doom-template` during the hackathon.
