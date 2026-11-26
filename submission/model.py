@@ -34,10 +34,10 @@ ENT_DIM = MAX_ENT * (ENT_FEAT + 2)  # features, type id, mask
 OBS_DIM = RAY_DIM + ENT_DIM + VITALS
 MAP = 32                      # ego-centric SLAM crop (see slam.py), packed bits per cell
 MAP_DIM = MAP * MAP
-MAP_CH = 7                    # free, wall, door, locked door, visited, unknown, frontier
+MAP_CH = 9                    # free, wall, door, locked door, visited, unknown, frontier, holding-a-key, tried locked door
 WIDE = 16                     # zoomed-out view (see slam.wide_packed)
 WIDE_DIM = WIDE * WIDE
-WIDE_CH = 6                   # seen floor, visited, frontier, door, locked door, wall
+WIDE_CH = 8                   # seen floor, visited, frontier, door, locked door, wall, holding-a-key, tried locked door
 FULL_DIM = OBS_DIM + MAP_DIM + WIDE_DIM  # network input: encoded observation, fine map, wide map
 VITAL_SCALE = np.array([100, 100, 7, 50, 100, 50, 25, 100, 1, 1, 1, 1, 1, 1, 10, 10, 10], np.float32)
 
@@ -185,7 +185,7 @@ class Policy(nn.Module):
         pa = Fn.one_hot(prev_action.clamp(0, NUM_ACTIONS - 1), NUM_ACTIONS).float()
         v = self.vit_mlp(torch.cat([vit, pa], dim=-1))
         mp = x[:, OBS_DIM:OBS_DIM + MAP_DIM].round().long().view(n, MAP, MAP)
-        bits = torch.stack([(mp >> b) & 1 for b in range(5)] + [((mp & 15) == 0).long(), (mp >> 5) & 1], dim=1).float()
+        bits = torch.stack([(mp >> b) & 1 for b in range(5)] + [((mp & 15) == 0).long(), (mp >> 5) & 1, (mp >> 6) & 1, (mp >> 7) & 1], dim=1).float()
         mfeat = Fn.relu(self.map_fc(self.map_conv(bits).flatten(1)))
         wp = x[:, OBS_DIM + MAP_DIM:OBS_DIM + MAP_DIM + WIDE_DIM].round().long().view(n, WIDE, WIDE)
         wbits = torch.stack([(wp >> b) & 1 for b in range(WIDE_CH)], dim=1).float()
