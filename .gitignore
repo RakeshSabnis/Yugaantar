@@ -222,3 +222,8 @@ _vizdoom.ini
 
 # Local validator / scorer artifacts
 *.lmp
+
+# macOS
+.DS_Store
+# The official wrapper lives in env/ (the ENV/ rule above matches it on case-insensitive macOS)
+!env/
