@@ -47,16 +47,30 @@ Details:
 
 ## Timeline
 
+Hard stop 03:00 (team deadline, extended from midnight). Times assume work starts at about 16:30.
+
 | Time | Stage | Submittable result |
 |---|---|---|
-| 16:00–16:30 | Repo layout fixed (template at the repo root), environment ready, random agent passes `validate.py` and is pushed | Random agent |
-| 16:30–17:30 | Map generator and local scorer | Random agent with a baseline score |
-| 17:30–19:00 | Teacher bot, measured on held-out maps | Random agent |
-| 19:00–21:00 | Network plus imitation (DAgger) | **First real neural agent** |
-| 21:00–22:30 | PPO fine-tune; Memory v2 and curiosity only if imitation is solid | Better agent, if it beats imitation |
-| 22:30–00:00 | Hardening, final validation, 2-page brief. No new features | Final submission |
+| 16:30–17:00 | Repo layout fixed (template at the repo root), environment ready, random agent passes `validate.py` and is pushed | Random agent |
+| 17:00–18:00 | Map generator and local scorer | Random agent with a baseline score |
+| 18:00–19:30 | Teacher bot, measured on held-out maps | Random agent |
+| 19:30–21:00 | Network plus imitation (DAgger) | **First real neural agent (about 21:00)** |
+| 21:00–00:00 | More DAgger rounds, then PPO fine-tune; every checkpoint scored on held-out maps, best one pushed each hour | Best agent so far |
+| 00:00–01:30 | Memory v2 and curiosity only if the agent is solid; otherwise more training | Best agent so far |
+| 01:30–03:00 | **Feature freeze.** Hardening, final validation, 2-page brief | Final submission |
 
-**Fallback:** if PPO does not beat imitation by 22:30, we submit the imitation agent. The egocentric map and curiosity are stretch goals; if they don't make it, the brief says so honestly and describes them as next steps.
+**Fallback:** if PPO does not beat imitation, we submit the imitation agent. The egocentric map and curiosity are stretch goals; if they don't make it, the brief says so honestly and describes them as next steps.
+
+## Scoring priorities
+
+The automated scorer decides who advances, so every choice is judged by what it earns there:
+
+1. **Never lose a map to a crash, timeout or invalid action.** That forfeits everything after it, so it comes before anything clever.
+2. **Exit first.** It is the largest reward and later tiers weigh more, so the generator and the teacher put most training time on navigation and keycard → locked door → exit, not combat.
+3. **Explore efficiently.** Unique areas count and spinning earns nothing, so the reward pays for new sectors and the agent is trained to keep moving.
+4. **Don't die early, avoid self-damage.** Both are penalised. `SELECT_NEXT_WEAPON` can be masked in situations where it could bring up the rocket launcher at close range (masking from observations is allowed).
+5. **Kills last.** They earn points, but the agent should not chase enemies at the cost of progress.
+6. **Our local score is the only number we trust.** A checkpoint is pushed only if it beats the last one on held-out maps and Freedoom levels.
 
 ## Passing the automated checks
 
