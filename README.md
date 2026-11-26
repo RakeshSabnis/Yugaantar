@@ -49,9 +49,13 @@ are our guess, so the numbers are relative):
 
 | | Tier 1 exit | Tier 2 exit | Tier 3 exit | Tier 4 exit | Tier-weighted score |
 | --- | --- | --- | --- | --- | --- |
-| Scripted teacher (ceiling for imitation) | 50% | 58% | 58% | 17% | 1079 |
-| Network after DAgger round 1 | 25% | 17% | 17% | 0% | 473 |
-| Network after DAgger round 2 (committed weights) | 17% | 25% | 25% | 0% | 584 |
+| Scripted teacher (ceiling for imitation) | 67% | 75% | 75% | 42% | 1366 |
+| Network after DAgger round 1 | 17% | 8% | 8% | 0% | 468 |
+| Network after DAgger round 2 | 50% | 33% | 0% | 0% | 556 |
+| Network after DAgger round 3 | 50% | 58% | 8% | 0% | 610 |
+| Network after DAgger round 4 (committed weights) | 42% | 50% | 17% | 0% | 666 |
+
+With 12 levels per tier, one level is 8 percentage points, so single-tier figures are noisy.
 
 Inference: 7.6 ms median per decision on one CPU thread (budget 40 ms), 2.1 s initialization.
 
@@ -61,7 +65,9 @@ Inference: 7.6 ms median per decision on one CPU thread (budget 40 ms), 2.1 s in
   map with a different exit style the agent falls back to exploring until it walks over the exit;
   exits that are wall switches are not handled.
 - Lifts and switch-operated doors are not handled.
-- Tier 4 (several locks, more monsters) is the weakest tier for both teacher and network.
+- The key chain is the weak spot: the network picks up keys and opens some locked doors but rarely
+  completes key -> locked door -> exit, and tier 4 (several locks) is the weakest tier for both
+  teacher and network.
 
 ## Repository layout
 
