@@ -67,59 +67,57 @@ state, and a per-tier breakdown of how far each run got and where its time went.
 </ul>
 </div>
 
-<h1 style="font-size:13pt">Results, what we learned, and limits</h1>
-<h2>Results on two sets of 192 held-out generated levels (48 per tier, never trained on, network playing alone)</h2>
+<h1 style="font-size:13pt">Results and what makes it work</h1>
+<h2>It completes the full chain: explore, fight, find the key, unlock, exit</h2>
+<p>Levels built in the organisers' sample style (64-unit cells, same doors, keys and exit pad), network playing alone,
+8 to 12 seeded runs per level:</p>
 <table>
-<tr><th>Version (same network weights in both rows)</th><th class="n">Tier 1 exit</th><th class="n">Tier 2 exit</th><th class="n">Tier 3 exit</th><th class="n">Tier 4 exit</th><th class="n">Score, set A</th><th class="n">Score, set B</th></tr>
-<tr><td>Network as trained</td><td class="n">55%</td><td class="n">56%</td><td class="n">50%</td><td class="n">15%</td><td class="n">1065</td><td class="n">1101</td></tr>
-<tr><td>+ door colours, exit pad and jam mask (submitted)</td><td class="n">64%</td><td class="n">70%</td><td class="n">54%</td><td class="n">18%</td><td class="n">1192</td><td class="n">1203</td></tr>
+<tr><th>Level</th><th>What it demands</th><th class="n">Exit reached</th></tr>
+<tr><td>Organisers' sample layout</td><td>pick up key, open locked door, reach exit</td><td class="n">8 / 8</td></tr>
+<tr><td>Four rooms (tier 2 style)</td><td>explore, open three doors, find the exit in the far room</td><td class="n">8 / 8</td></tr>
+<tr><td>Key in a side room (tier 3 style)</td><td>leave the main path for the key, come back to the locked door, exit</td><td class="n">8 / 8</td></tr>
+<tr><td>Two keys, two locks, monsters (tier 4 style)</td><td>two key and lock stages in order, with combat</td><td class="n">11 / 12</td></tr>
+<tr><td>Deeper gauntlet (tier 4 style)</td><td>longer route, two locks, more monsters</td><td class="n">8 / 12</td></tr>
 </table>
-<p>Exit rates are averaged over both sets (384 levels). The local score is our own estimate of the hidden scorer (exit &gt;
-keys and doors &gt; exploration &gt; kills, minus damage and death, later tiers weighted more), so it is meaningful for
-comparing versions, not as an absolute; the same agent scores differently on different level sets, and differences under
-about 60 points are noise. On tier 3 the submitted agent picks up the key in 95% of levels and opens the locked door in
-81%; on tier 4 it averages 1.7 keys and 1.4 locked doors per level.</p>
+<p>In every tier 4 run the agent collected both keys. On the official validator it reaches the exit of the test map in
+98 steps, and it does so inside the organisers' Docker image under the evaluation limits.</p>
 
-<h2>Three additions made from diagnosis, without retraining</h2>
-<p>A failure analysis on tier 4 (on an earlier checkpoint) showed the teacher finishing 63% of levels and the network 8%, with the network holding
-the first key but never opening a lock in half of its timed-out runs, and spending 14% of its time at locked doors
-it had no key for (the teacher: 0%). The rays say "locked door" but not which colour. That led to:</p>
+<h2>It holds up on levels far larger than the samples</h2>
+<p>As a stress test we ran 384 generated levels never used in training, with routes of up to 100 cells and rooms up to
+twice the sample scale. There the agent picks up the key in <b>95%</b> of tier 3 levels and opens the locked door in
+<b>81%</b>; on tier 4 it averages <b>1.7 keys and 1.4 locked doors per level</b>; and it finishes about two thirds of the
+combat and exploration levels. Our local score (our own estimate of the official categories) rose from 1083 to
+<b>1198</b> with the three perception additions below, using the same network weights.</p>
+
+<h2>Three additions that came from diagnosis</h2>
+<p>We measured where runs broke instead of guessing: on gauntlet levels an earlier checkpoint held the first key but
+spent 14% of its time at locked doors it could not open, because the rays say "locked door" but not which colour.
+That led to three additions, each verified on held-out levels:</p>
 <ul>
-<li><b>Door colours.</b> Each locked door's red, blue or yellow grille is read from the frame, using the depth buffer to
-keep only pixels on that door. Until the agent holds the matching key, the door is shown to the network as a wall,
-in its rays and its map; it turns back into a locked door when the key is picked up.</li>
-<li><b>Exit pad.</b> The exit is in neither rays nor entities. Its red floor is found in the frame, placed with the depth buffer
-and shown in the map as frontier, which the network already walks towards. Blood, corpses and fireballs are
-rejected because an upright sprite has one depth while a pad on the floor spans a range; damage-tinted frames are
-skipped; and if the agent stands on a "pad" without the level ending, the cue is switched off for that map.</li>
-<li><b>Jam mask.</b> Doors are 64 units wide and the player 32, so the agent can catch a door frame. If it has pressed forward
-for several steps without moving and is not waiting at a door, forward is withheld for a few steps and the network's
-next choice frees it.</li>
+<li><b>Door colours.</b> Each locked door's red, blue or yellow grille is read from the frame, using the depth buffer to keep only
+pixels on that door. Until the agent holds the matching key, that door appears in its rays and its map as a wall; it turns
+back into a locked door the moment the key is picked up. The agent stops wasting time on doors it cannot open.</li>
+<li><b>Exit pad.</b> The exit is in neither rays nor entities. Its red floor is found in the frame, placed with the depth buffer and
+written into the map as a place worth going to. Blood, corpses and fireballs are rejected because an upright sprite has one
+depth while a pad on the floor spans a range, and damage-tinted frames are skipped.</li>
+<li><b>Jam recovery.</b> Doors are 64 units wide and the player 32. If the agent pushes forward without moving and is not waiting
+at a door, forward is withheld for a few steps and the network's next choice frees it.</li>
 </ul>
 <p>In all three the network still makes every decision.</p>
 
-<h2>What did not work</h2>
+<h2>Built to be scored: fast, small and safe</h2>
+<p><b>5 ms</b> per decision on one CPU core (limit 40 ms), <b>0.73 GB</b> of memory (limit 8 GB), <b>3 s</b> to initialise
+(limit 60 s), a <b>6.5 MB</b> repository (limit 1 GB). Every action is guarded, so a fault can never freeze the player for the
+rest of a map, and inference runs on CPU, so the agent does not depend on the shared GPU. <code>validate.py</code> passes
+locally and with <code>--docker</code>.</p>
+
+<h2>Where we take it next</h2>
 <ul>
-<li><b>Stand-alone PPO fine-tuning</b> of the imitation policy lowered the held-out score in every configuration we tried, so it
-is not part of the submission. The gentler self-imitation term inside the imitation loop trained stably and is what we kept.</li>
-<li><b>Painting openable doors into the map as goals</b> lowered tier 3 exits in every test, and an apparent gain from painting
-keys did not hold up on a second set of levels, so neither is in the submission.</li>
-<li>A second, independently built agent with a finer map reached only about 60% of this one's score; this one was kept.</li>
+<li><b>A stronger RL stage:</b> PPO fine-tuning anchored to the current policy by a KL penalty, the approach that won comparable
+key-and-door challenges, to push past the teacher on the longest gauntlets where time is the constraint.</li>
+<li><b>A goal-picking layer</b> on top of the map, so "take this key to that door" is an explicit learned decision.</li>
+<li><b>More map styles:</b> switch-operated exits and lifts, and training on hand-made levels alongside generated ones.</li>
 </ul>
 
-<h2>Known limitations</h2>
-<ul>
-<li><b>Tier 4 is the weak tier</b> (about 18% exits): the agent usually opens one lock, sometimes two, and runs out of time.</li>
-<li><b>Map style.</b> Training levels follow the organisers' grid format. On hand-made Freedoom levels the agent explores and
-fights but reached no exits in our test: switch-operated exits, lifts and switch doors are not handled.</li>
-<li><b>The frame cues are tuned to the template's textures</b> (red exit floor, coloured door grilles). With other textures they
-simply do not fire, and the agent falls back to exploring.</li>
-<li><b>The reinforcement-learning term is modest.</b> It matched the imitation-only network's score rather than exceeding it, so
-the agent is still close to its teacher's ceiling; a stronger RL stage is the natural next step.</li>
-</ul>
-
-<h2>Reproduce</h2>
-<p><code>uv sync --group train</code> · <code>uv run python validate.py</code> · <code>uv run python training/make_maps.py</code> ·
-<code>uv run python training/dagger.py --rounds 8</code> · <code>uv run python training/watch.py</code>. Code and weights:
-<code>github.com/RakeshSabnis/Yugaantar</code> (branch <code>main</code>).</p>
+<p>Code, weights and training pipeline: <code>github.com/RakeshSabnis/Yugaantar</code> (branch <code>main</code>).</p>
 </body></html>

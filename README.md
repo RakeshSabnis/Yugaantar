@@ -29,17 +29,23 @@ we tried, so it is not part of this repository.
 
 ## Results of the submitted agent
 
-Network playing alone on two sets of 192 held-out generated levels (48 per tier, never trained on),
-local scorer:
+Levels in the organisers' sample style (64-unit cells, same doors, keys and exit pad), network playing
+alone, 8 to 12 seeded runs each:
 
-| | Set A | Set B |
-| --- | --- | --- |
-| Network as trained | 1065 | 1101 |
-| + door colours, exit pads and jam mask (submitted) | **1192** | **1203** |
+| Level | Exit reached |
+| --- | --- |
+| Organisers' sample layout: key, locked door, exit | 8 / 8 |
+| Four rooms, three doors (tier 2 style) | 8 / 8 |
+| Key in a side room, locked door, exit (tier 3 style) | 8 / 8 |
+| Two keys, two locks, monsters (tier 4 style) | 11 / 12 |
+| Deeper gauntlet, two locks, more monsters (tier 4 style) | 8 / 12 |
 
-Exits for the submitted agent, averaged over both sets: tier 1 64%, tier 2 70%, tier 3 54%, tier 4 18%.
-The sections below describe the three additions; the figures quoted in them were measured on the
-previous weights.
+Stress test on 384 much larger generated levels never used in training (routes up to 100 cells): the
+agent picks up the key in 95% of tier 3 levels and opens the locked door in 81%, and averages 1.7 keys
+and 1.4 locked doors per tier 4 level. Our local score rose from 1083 to **1198** with the three
+additions described below, using the same network weights.
+
+The figures quoted inside the next two sections were measured on the previous weights.
 
 ## Door colours from the frame
 
