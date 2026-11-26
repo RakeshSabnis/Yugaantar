@@ -227,3 +227,7 @@ _vizdoom.ini
 .DS_Store
 # The official wrapper lives in env/ (the ENV/ rule above matches it on case-insensitive macOS)
 !env/
+
+# Generated training maps (reproducible from training/make_maps.py)
+maps_gen/
+runs/
