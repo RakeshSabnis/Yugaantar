@@ -30,6 +30,7 @@ import vizdoom as vd  # noqa: E402
 _set_res = vd.DoomGame.set_screen_resolution
 vd.DoomGame.set_screen_resolution = lambda self, r: _set_res(self, vd.ScreenResolution.RES_640X480)
 GAME_W, GAME_H = 640, 480
+PANEL_H = 4 * 24 + 10  # status panel under the game view
 
 
 MAP_VIEW = 72      # cells shown around the agent (72 x 64 = 4608 map units)
@@ -51,7 +52,7 @@ class MapView:
         pygame.init()
         size = MAP_VIEW * MAP_PX
         self.mx = GAME_W + 8  # map panel x offset
-        self.screen = pygame.display.set_mode((GAME_W + 8 + size, max(GAME_H, size) + 28))
+        self.screen = pygame.display.set_mode((GAME_W + 8 + size, max(GAME_H, size) + PANEL_H))
         pygame.display.set_caption("DOOM agent: game view + SLAM map")
         self.font = pygame.font.SysFont(None, 22)
 
@@ -90,7 +91,9 @@ class MapView:
         hx, hy = px + 18 * math.cos(slam.heading), py - 18 * math.sin(slam.heading)
         pg.draw.line(self.screen, COLORS["agent"], (px, py), (hx, hy), 3)
         pg.draw.circle(self.screen, COLORS["agent"], (px, py), 5)
-        self.screen.blit(self.font.render(info, True, (230, 230, 230)), (6, max(GAME_H, MAP_VIEW * MAP_PX) + 5))
+        y0 = max(GAME_H, MAP_VIEW * MAP_PX) + 6
+        for i, (text, color) in enumerate(info):
+            self.screen.blit(self.font.render(text, True, color), (8, y0 + 24 * i))
         pg.display.flip()
         return True
 
@@ -129,6 +132,11 @@ def main():
     grid_path = Path(wad).with_suffix(".txt")
     if grid_path.exists():
         print(grid_path.read_text())
+    totals: dict = {}
+    if grid_path.exists():
+        g = grid_path.read_text()
+        totals = {"keys": sum(g.count(c) for c in "rby"), "locks": sum(g.count(c) for c in "RBY"), "doors": g.count("D"),
+                  "monsters": sum(g.count(c) for c in "zscid")}
     env = make_env(wad, mapname, episode_ticks=ticks, render_buffers=not a.no_map)
     obs, _ = env.reset(seed=0)
     tracker = Tracker(env.privileged_state())
@@ -152,10 +160,13 @@ def main():
     slam.observe(obs)
     dt = 4 / 35 / a.speed
     k = 0
+    act_ms = 0.0
     try:
         while True:
             t0 = time.time()
+            ta = time.perf_counter()
             buttons = step(obs)
+            act_ms = 0.9 * act_ms + 0.1 * (time.perf_counter() - ta) * 1000 if k else (time.perf_counter() - ta) * 1000
             slam.apply_action(buttons)
             obs, r, term, trunc, info = env.step(buttons)
             slam.observe(obs)
@@ -163,8 +174,21 @@ def main():
             k += 1
             if view is not None:
                 v = obs["vitals"]
+                pr = env.privileged_state()
+                res = tracker.result("", 0)
                 keys = "".join(c for c, i in (("B", 8), ("Y", 9), ("R", 10)) if v[i] > 0 or v[i + 3] > 0)
-                if not view.draw(slam, f"{level}   |   step {k}/{ticks // 4}  health {int(v[0])}  ammo {int(v[3])}  keys {keys or '-'}  kills {int(env.privileged_state()['kills'])}", obs.get("rgb")):
+                white, good, bad, dim = (235, 235, 235), (90, 230, 110), (240, 90, 80), (170, 170, 170)
+                tot = lambda n: f"/{n}" if n is not None else ""  # noqa: E731
+                lines = [
+                    (f"{level}   |   step {k}/{ticks // 4}   |   {act_ms:.1f} ms per decision (limit 40 ms)", white if act_ms < 40 else bad),
+                    (f"PROGRESS   exit: {'REACHED' if res.exit else 'not yet'}    keycards: {res.keys}{tot(totals.get('keys'))} {('[' + keys + ']') if keys else ''}    "
+                     f"locked doors opened: {res.locks_opened}{tot(totals.get('locks'))}    doors opened: {res.doors_opened}{tot(totals.get('doors'))}", good if res.exit else white),
+                    (f"EXPLORE / COMBAT   areas explored: {res.areas}    enemies killed: {res.kills}{tot(totals.get('monsters'))}    "
+                     f"damage taken: {int(res.damage)}", white),
+                    (f"SURVIVAL   health: {int(v[0])}   armor: {int(v[1])}   ammo: {int(v[3])}   {'DEAD' if res.dead else 'alive'}"
+                     f"      our score estimate: {res.score():.0f}", bad if res.dead or v[0] < 30 else white),
+                ]
+                if not view.draw(slam, lines, obs.get("rgb")):
                     view = None
             if term or trunc:
                 break
