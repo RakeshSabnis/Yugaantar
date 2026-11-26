@@ -162,6 +162,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--max-pool", type=int, default=2500, help="max episodes kept in the aggregated dataset")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--tier-weights", type=float, nargs=4, default=[1, 1, 1, 1],
+                    help="relative sampling weight of tier 1..4 maps when choosing each round's games")
     ap.add_argument("--resume", default=None)
     ap.add_argument("--resume-beta", type=float, default=0.25, help="teacher mix per step when resuming")
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -196,7 +198,8 @@ def main():
     for rnd in range(a.rounds):
         beta = betas[min(rnd, len(betas) - 1)] if not a.resume else a.resume_beta
         weights = str(out / "last.pt") if (out / "last.pt").exists() else None
-        chosen = [items[i] for i in rng.choice(len(items), size=min(a.episodes, len(items)), replace=False)]
+        tw = np.array([a.tier_weights[it["tier"] - 1] for it in items], np.float64)
+        chosen = [items[i] for i in rng.choice(len(items), size=min(a.episodes, len(items)), replace=False, p=tw / tw.sum())]
         t0 = time.time()
         eps = collect(chosen, weights, beta, a.workers, seed0=rnd * 100000 + 17)
         steps = sum(len(e["y"]) for e in eps)
