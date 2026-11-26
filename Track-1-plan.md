@@ -84,8 +84,9 @@ The automated scorer decides who advances, so every choice is judged by what it 
 ## Hardware
 
 - **Training runs on CPU cores:** the game engine is CPU-only, so many game copies run in parallel, one per core. The Apple GPU (MPS) may help with network updates; we measure both and use the faster.
-- **MacBook Air M5 (10 cores, 16 GB):** main machine. Plugged in and awake for the night. Training capped below 10 cores so the laptop stays usable.
-- **ROG Strix (AMD GPU, 4 GB):** extra game copies or a second training run. Its GPU doesn't matter, because CUDA doesn't support AMD and the model is small.
+- **MacBook Air M5 (10 cores, 16 GB): the only machine for this version.** Plugged in and kept awake (`caffeinate`) for the night. Training uses 7–8 game copies so the laptop stays usable. It is fanless, so sustained load slows the chip by roughly 30–40%; the timeline allows for that.
+- **The ROG is a separate team attempt** (another member's version), not part of this pipeline. The team picks whichever version scores better.
+- **Fair comparison:** both versions are scored with the same local scorer on the same held-out maps (`training/` scorer plus a fixed map list), committed to this repo so the other member can run it too.
 - **Weights transfer cleanly:** weights trained on a Mac load unchanged on their Linux machine.
 
 ## Risks
