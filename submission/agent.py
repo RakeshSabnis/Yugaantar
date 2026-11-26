@@ -3,7 +3,7 @@
 Every decision comes from the trained network (submission/model.py): no scripted rules, pathfinding or
 aiming. The only non-learned logic is safety: input sanitising, an exception guard that always returns a
 valid action, and action masking from the agent's own previous action (USE / weapon switch are
-edge-triggered, so pressing them twice in a row is masked out).
+edge-triggered, so pressing them twice in a row is masked out). Sampling uses one fixed temperature.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ from actions import NEXTW_ACTIONS, NUM_ACTIONS, USE_ACTIONS, to_buttons  # noqa:
 from model import Perception, Policy, load_compatible  # noqa: E402
 
 TEMPERATURE = float(__import__("os").environ.get("DOOM_TEMPERATURE", "0.5"))  # low-temperature sampling: mostly the best action, enough noise to escape loops
-COMBAT_TEMPERATURE = float(__import__("os").environ.get("DOOM_COMBAT_TEMPERATURE", "0.3"))
 
 
 class DoomAgent:
@@ -73,12 +72,7 @@ class DoomAgent:
                 logits[list(NEXTW_ACTIONS)] = -np.inf
             if not np.all(np.isfinite(logits[np.isfinite(logits)])) or not np.isfinite(logits).any():
                 raise ValueError("bad logits")
-            # Sharper sampling while an enemy is in view (precise aiming/dodging), broader otherwise
-            # (exploration). This only scales the network's own distribution; it never picks an action.
-            ents = observation["visible_entities"]
-            enemy = bool(np.any((np.asarray(ents["mask"]) > 0) & np.isin(np.asarray(ents["entity_type"]), (1, 2, 3))))
-            temp = COMBAT_TEMPERATURE if enemy else TEMPERATURE
-            z = (logits - logits[np.isfinite(logits)].max()) / temp
+            z = (logits - logits[np.isfinite(logits)].max()) / TEMPERATURE
             p = np.exp(z)
             p /= p.sum()
             a = int(self.rng.choice(NUM_ACTIONS, p=p))
