@@ -246,9 +246,15 @@ def main() -> None:
         beta = 1.0 if it == 0 else max(0.15, 0.6**it)  # share of the time the teacher drives
         seeds = range(it * args.episodes, (it + 1) * args.episodes)
         t0 = time.time()
-        rows = collect(seeds, beta, data / f"iter_{it:02d}", args.workers)
+        have = len(list((data / f"iter_{it:02d}").glob("ep_*.npz")))
+        if have >= 0.98 * args.episodes:
+            log(f"iter {it}: reusing {have} levels already collected")
+            rows = []
+        else:
+            rows = collect(seeds, beta, data / f"iter_{it:02d}", args.workers)
         n = sum(r["steps"] for r in rows)
-        log(f"iter {it}: collected {n} steps from {len(rows)} levels in {time.time() - t0:.0f}s (teacher drives {beta:.0%}); "
+        if rows:
+          log(f"iter {it}: collected {n} steps from {len(rows)} levels in {time.time() - t0:.0f}s (teacher drives {beta:.0%}); "
             f"exit {np.mean([r['exit'] for r in rows]):.2f}, memory drift median {np.median([r['drift'] for r in rows]):.0f} units")
         eps = load([data / f"iter_{k:02d}" for k in range(it + 1)])
         train(eps, args.first_steps if it == 0 and args.first_steps else args.train_steps, device, weights if it > 0 else None, weights, log=log)

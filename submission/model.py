@@ -55,7 +55,7 @@ class ValueIteration(nn.Module):
     after K steps the values around the agent say which way the worthwhile places are. Every
     parameter is trained; nothing here is a hand-written search."""
 
-    def __init__(self, in_ch: int, k: int = 16, q: int = 8):
+    def __init__(self, in_ch: int, k: int = 8, q: int = 8):
         super().__init__()
         self.k = k
         self.enc = nn.Sequential(nn.Conv2d(in_ch, 24, 3, padding=1), nn.ReLU(), nn.Conv2d(24, 2, 1))
@@ -63,6 +63,9 @@ class ValueIteration(nn.Module):
         self.out_dim = q * 4 + 36
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Plan at half resolution: a quarter of the cost, and each step reaches twice as far, so K
+        # steps span the whole crop.
+        x = F.max_pool2d(x, 2)
         rp = self.enc(x)  # reward and a second learned map (e.g. passability)
         v = torch.zeros_like(rp[:, :1])
         for _ in range(self.k):
