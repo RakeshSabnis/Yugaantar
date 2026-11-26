@@ -1,4 +1,4 @@
-# Can It Play DOOM? — Yugaantar DevForge, Track 1
+# Can It Play DOOM? — Team TriTokens · Yugaantar DevForge, Track 1
 
 A neural agent that plays unseen DOOM levels: it explores, fights, finds keycards, opens locked doors and
 looks for the exit. Built from the official `devforge-doom-template` during the hackathon.
@@ -73,21 +73,25 @@ same weights (local score 1108 -> 1141; exits on tiers 1-3 from 65/67/50% to 75/
 ## Repository layout
 
 ```
-submission/agent.py      DoomAgent: the evaluation entry point (network + safety guard)
-submission/model.py      policy network and observation encoding
-submission/slam.py       occupancy map + odometry from the 64 rays and the agent's own actions
-submission/actions.py    the 23 button combinations the policy chooses from
-submission/weights/      trained weights (Git LFS)
+submission/                 what is evaluated
+  agent.py                  DoomAgent: the evaluation entry point
+  model.py                  policy network and observation encoding
+  slam.py                   map and odometry built from the rays, the frame and the agent's own actions
+  actions.py                the 23 button combinations the policy chooses from
+  weights/policy.pt         trained weights (Git LFS)
 
-training/mapgen.py       procedural maps in the organisers' ASCII-grid UDMF format, all four tiers
-training/teacher.py      scripted teacher (TRAINING ONLY): frontier exploration, keys, doors, combat
-training/dagger.py       imitation learning (DAgger)
-training/scorer.py       local estimate of the official scoring, from privileged state
-training/evaluate.py     score a policy on a held-out map set
-training/compare.py      score any checkout's agent on the same maps and seeds
-training/watch.py        watch the agent play, with its SLAM map and objectives panel
+training/                   how it was trained (see training/README.md)
+  mapgen.py, make_maps.py   procedural levels in the organisers' format, all four tiers
+  teacher.py                scripted teacher, training only
+  dagger.py                 imitation (DAgger) with the reinforcement-learning term and curiosity reward
+  rnd.py                    learned novelty bonus (random network distillation)
+  scorer.py, evaluate.py    local estimate of the official scoring; score a policy on held-out levels
+  diagnose.py               per-tier failure analysis: how far each run got and where its time went
+  publish.py                copy a checkpoint into submission/weights/
+  watch.py                  watch the agent play, with its map
 
-env/ docs/ tests/ validate.py   the official template, unchanged
+docs/brief.pdf              the 2-page project brief
+docs/*.md, env/, tests/, maps/, validate.py, Dockerfile, docker/    the official template, unchanged
 ```
 
 ## The agent
