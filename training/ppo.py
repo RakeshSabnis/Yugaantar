@@ -29,7 +29,7 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 
-REWARD = {"exit": 10.0, "key": 3.0, "door": 0.5, "lock": 3.0, "area": 0.15, "kill": 0.5, "damage": 0.01, "death": 5.0, "step": 0.002}
+REWARD = {"exit": 10.0, "key": 3.0, "door": 0.5, "lock": 3.0, "area": 0.15, "kill": 0.5, "damage": 0.01, "death": 5.0, "step": 0.002, "stuck": 0.02}
 
 
 def rollout(args) -> dict:
@@ -43,7 +43,7 @@ def rollout(args) -> dict:
     from actions import NEXTW_ACTIONS, NUM_ACTIONS, USE_ACTIONS, to_buttons
     from model import OBS_DIM, Perception, Policy
     from scorer import AREA, Tracker
-    from teacher import Teacher, door_open_fn
+    from teacher import Teacher, dir_bin, door_open_fn
 
     rng = np.random.default_rng(seed)
     grid = Path(item["path"]).with_suffix(".txt").read_text()
@@ -59,7 +59,9 @@ def rollout(args) -> dict:
     tracker = Tracker(p0)
     areas = {(math.floor(p0["x"] / AREA), math.floor(p0["y"] / AREA))}
     last = {"keys": 0, "doors": 0, "locks": 0, "kills": 0, "damage": 0.0}
-    X, M, PA, A, LP, R, Y = [], [], [], [], [], [], []
+    X, M, PA, A, LP, R, Y, D, W = [], [], [], [], [], [], [], [], []
+    trail: list = []
+    stuck_now = False
     perception = Perception()
     prev = 0
     while True:
@@ -74,7 +76,8 @@ def rollout(args) -> dict:
         z = (lg - lg.max()) / temperature
         p = np.exp(z); p /= p.sum()
         a = int(rng.choice(NUM_ACTIONS, p=p))
-        X.append(x[:OBS_DIM].astype(np.float16)); M.append(x[OBS_DIM:].astype(np.uint8)); PA.append(prev); A.append(a); LP.append(math.log(max(p[a], 1e-12))); Y.append(label)
+        X.append(x[:OBS_DIM].astype(np.float16)); M.append(x[OBS_DIM:].astype(np.uint8)); PA.append(prev); A.append(a); LP.append(math.log(max(p[a], 1e-12))); Y.append(label); D.append(dir_bin(teacher.dir_rel))
+        W.append(3.0 if stuck_now else 1.0)  # where the agent is stuck, the teacher's decision matters most
         teacher.prev_action, teacher.prev_use = a, a in USE_ACTIONS
         buttons = to_buttons(a)
         perception.did(buttons)
@@ -83,6 +86,11 @@ def rollout(args) -> dict:
         tracker.update(pr)
         res = tracker.result("", item["tier"])
         r = -REWARD["step"]
+        # standing still (e.g. pushing against a locked door) earns a penalty: progress needs movement
+        trail.append((pr["x"], pr["y"]))
+        stuck_now = len(trail) > 20 and math.hypot(pr["x"] - trail[-21][0], pr["y"] - trail[-21][1]) < 24.0
+        if stuck_now:
+            r -= REWARD["stuck"]
         cell = (math.floor(pr["x"] / AREA), math.floor(pr["y"] / AREA))
         if cell not in areas:
             areas.add(cell); r += REWARD["area"]
@@ -101,7 +109,7 @@ def rollout(args) -> dict:
     env.close()
     out = tracker.result(Path(item["path"]).name, item["tier"]).as_dict()
     return {"x": np.stack(X), "m": np.stack(M), "pa": np.array(PA, np.int16), "a": np.array(A, np.int16), "lp": np.array(LP, np.float32),
-            "r": np.array(R, np.float32), "y": np.array(Y, np.int16), "truncated": bool(trunc and not term), "result": out}
+            "r": np.array(R, np.float32), "y": np.array(Y, np.int16), "d": np.array(D, np.int16), "w": np.array(W, np.float32), "truncated": bool(trunc and not term), "result": out}
 
 
 def masked_logits(logits, prev, use_ids, nextw_ids):
@@ -131,6 +139,7 @@ def main():
     ap.add_argument("--ent", type=float, default=0.005)
     ap.add_argument("--bc", type=float, default=0.5, help="initial weight of the teacher cross-entropy term")
     ap.add_argument("--bc-decay", type=float, default=0.985)
+    ap.add_argument("--bc-min", type=float, default=0.15, help="the teacher term never fades below this")
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--eval-every", type=int, default=10)
     ap.add_argument("--device", default="mps")
@@ -187,11 +196,11 @@ def main():
         T = max(len(e["a"]) for e in eps)
         D = eps[0]["x"].shape[1] + eps[0]["m"].shape[1]
         x = np.zeros((B, T, D), np.float32); pa = np.zeros((B, T), np.int64); act = np.zeros((B, T), np.int64)
-        lp_old = np.zeros((B, T), np.float32); rew = np.zeros((B, T), np.float32); y = np.zeros((B, T), np.int64); m = np.zeros((B, T), np.float32)
+        lp_old = np.zeros((B, T), np.float32); rew = np.zeros((B, T), np.float32); y = np.zeros((B, T), np.int64); dd = np.zeros((B, T), np.int64); ww = np.ones((B, T), np.float32); m = np.zeros((B, T), np.float32)
         for i, e in enumerate(eps):
             k = len(e["a"])
-            x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; act[i, :k] = e["a"]; lp_old[i, :k] = e["lp"]; rew[i, :k] = e["r"]; y[i, :k] = e["y"]; m[i, :k] = 1
-        tx, tpa, tact, tlp, ty, tm = (torch.from_numpy(v).to(dev) for v in (x, pa, act, lp_old, y, m))
+            x[i, :k, :e["x"].shape[1]] = e["x"]; x[i, :k, e["x"].shape[1]:] = e["m"]; pa[i, :k] = e["pa"]; act[i, :k] = e["a"]; lp_old[i, :k] = e["lp"]; rew[i, :k] = e["r"]; y[i, :k] = e["y"]; dd[i, :k] = e["d"]; ww[i, :k] = e["w"]; m[i, :k] = 1
+        tx, tpa, tact, tlp, ty, tm, tdd, tww = (torch.from_numpy(v).to(dev) for v in (x, pa, act, lp_old, y, m, dd, ww))
         with torch.no_grad():
             _, values, _, _ = model(tx, tpa, model.initial_state(B, dev))
         values = values.float().cpu().numpy() * m
@@ -227,7 +236,7 @@ def main():
                     mm = tm[idx_t, sl]
                     if mm.sum() == 0:
                         break
-                    logits, v, _, h = model(tx[idx_t, sl], tpa[idx_t, sl], h)
+                    logits, v, aux, h = model(tx[idx_t, sl], tpa[idx_t, sl], h)
                     h = h.detach()
                     logits = masked_logits(logits, tpa[idx_t, sl], use_ids, nextw_ids) / a.temperature
                     logp_all = torch.log_softmax(logits, -1)
@@ -238,8 +247,11 @@ def main():
                     vl = (v - tret[idx_t, sl]) ** 2
                     ent = -(logp_all.exp() * logp_all).sum(-1)
                     bcl = Fn.cross_entropy(logits.reshape(-1, logits.shape[-1]), ty[idx_t, sl].reshape(-1), reduction="none").view_as(lp)
+                    # keep the 'which way to go' head trained on the teacher's waypoint direction
+                    bcl = bcl + 0.5 * Fn.cross_entropy(aux[2].reshape(-1, aux[2].shape[-1]), tdd[idx_t, sl].reshape(-1), reduction="none").view_as(lp)
                     # one optimizer step per minibatch: accumulate gradients over all chunks
                     # warm-up: learn the value function only, leave the policy untouched
+                    bcl = bcl * tww[idx_t, sl]
                     pw = 0.0 if it <= a.value_warmup else 1.0
                     loss = ((pw * (pl - a.ent * ent + bc * bcl) + 0.5 * vl) * mm).sum() / n_tot
                     loss.backward()
@@ -250,7 +262,7 @@ def main():
         model.eval()
         torch.save({"model": model.state_dict()}, out / "last.pt")
         if it > a.value_warmup:
-            bc *= a.bc_decay
+            bc = max(a.bc_min, bc * a.bc_decay)
         s = np.mean(stats, 0)
         res = [e["result"] for e in eps]
         log(f"it {it}: exit {np.mean([r['exit'] for r in res]):.2f} dead {np.mean([r['dead'] for r in res]):.2f} "

@@ -33,8 +33,8 @@ GAME_W, GAME_H = 640, 480
 PANEL_H = 4 * 24 + 10  # status panel under the game view
 
 
-MAP_SIZE = 480     # map panel size in pixels
-MAP_SPAN = 4600.0  # map units shown across the panel
+MAP_SIZE = 680     # map panel size in pixels
+MAP_SPAN = 3400.0  # map units shown across the panel
 BG = (11, 15, 20)
 GRID = (24, 32, 42)
 FREE = (38, 84, 96)
@@ -67,9 +67,13 @@ class MapView:
         self.screen = pygame.display.set_mode((GAME_W + 8 + MAP_SIZE, max(GAME_H, MAP_SIZE) + PANEL_H))
         pygame.display.set_caption("DOOM agent: game view + SLAM map")
         self.font = pygame.font.SysFont("menlo,monaco,couriernew", 15)
-        self.small = pygame.font.SysFont("menlo,monaco,couriernew", 12)
+        self.small = pygame.font.SysFont("menlo,monaco,couriernew", 14)
         self.traj: list[tuple[float, float]] = []
         self.pts = {1: set(), 2: set(), 3: set()}  # hit points snapped to 8 units, by type
+
+    def reset(self) -> None:
+        self.traj = []
+        self.pts = {1: set(), 2: set(), 3: set()}
 
     def _accumulate(self, slam, obs) -> list[tuple[float, float]]:
         import math
@@ -138,20 +142,20 @@ class MapView:
         pg.draw.polygon(overlay, (255, 255, 255, 22), fov)
         panel.blit(overlay, (0, 0))
         # point cloud of everything the rays have hit
-        for t, col, r in ((1, WALL_PT, 1), (2, DOOR_PT, 2), (3, LOCK_PT, 2)):
+        for t, col, r in ((1, WALL_PT, 1), (2, DOOR_PT, 3), (3, LOCK_PT, 3)):
             for x, y in self.pts[t]:
                 px, py = to_px(x, y)
                 if 0 <= px < S and 0 <= py < S:
                     if r == 1:
-                        panel.set_at((int(px), int(py)), col)
+                        panel.fill(col, (int(px), int(py), 2, 2))
                     else:
                         pg.draw.circle(panel, col, (int(px), int(py)), r)
         # trajectory with keyframes
         if len(self.traj) > 1:
-            pg.draw.aalines(panel, TRAJ, False, [to_px(x, y) for x, y in self.traj])
+            pg.draw.lines(panel, TRAJ, False, [to_px(x, y) for x, y in self.traj], 2)
             for x, y in self.traj[::20]:
                 px, py = to_px(x, y)
-                pg.draw.rect(panel, KEYFRAME, (px - 2, py - 2, 5, 5), 1)
+                pg.draw.rect(panel, KEYFRAME, (px - 3, py - 3, 7, 7), 1)
         # agent pose: arrowhead
         h = slam.heading
         tip = to_px(slam.x + 110 * math.cos(h), slam.y + 110 * math.sin(h))
@@ -172,7 +176,7 @@ class MapView:
 
         self.screen.fill((6, 8, 11))
         if frame is not None and frame.ndim == 3:
-            self.screen.blit(pg.surfarray.make_surface(np.ascontiguousarray(frame.transpose(1, 0, 2))), (0, 0))
+            self.screen.blit(pg.surfarray.make_surface(np.ascontiguousarray(frame.transpose(1, 0, 2))), (0, (max(GAME_H, MAP_SIZE) - GAME_H) // 2))
         self.screen.blit(panel, (self.mx, 0))
         y0 = max(GAME_H, MAP_SIZE) + 8
         for i, (text, color) in enumerate(info):
@@ -184,24 +188,48 @@ class MapView:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--policy", default="agent", choices=["agent", "teacher"])
-    ap.add_argument("--weights", default=str(ROOT / "runs" / "dagger_slam" / "best.pt"),
-                    help="checkpoint to play (default: best map-equipped agent so far)")
+    ap.add_argument("--weights", default=str(ROOT / "submission" / "weights" / "policy.pt"),
+                    help="checkpoint to play (default: the submitted agent)")
     ap.add_argument("--map", default=None, help="file.wad or file.wad:MAP01 (default: random held-out map)")
     ap.add_argument("--speed", type=float, default=1.0, help="1.0 = real game speed")
     ap.add_argument("--no-map", action="store_true", help="don't open the SLAM map window")
     ap.add_argument("--save-map", default=None, help="save the final map window as a PNG")
+    ap.add_argument("--live", action="store_true",
+                    help="keep playing: before every game, load the newest checkpoint the training run has written "
+                         "(runs/*/last.pt) and play it on a random training map")
     a = ap.parse_args()
     if a.policy == "agent" and not Path(a.weights).exists():
         print(f"no checkpoint at {a.weights} yet: showing the teacher instead")
         a.policy = "teacher"
 
+    view = None if a.no_map else MapView()
+    while True:
+        weights, label = a.weights, ""
+        if a.live:
+            cands = sorted((ROOT / "runs").glob("*/last.pt"), key=lambda q: q.stat().st_mtime)
+            if cands:
+                weights = str(cands[-1])
+                label = f"LIVE {cands[-1].parent.name} @ {time.strftime('%H:%M', time.localtime(cands[-1].stat().st_mtime))}  |  "
+        try:
+            keep_going = play(a, view, weights, label)
+        except (RuntimeError, EOFError, OSError) as e:  # e.g. checkpoint being written right now
+            print(f"retrying: {e}")
+            time.sleep(2)
+            continue
+        if not a.live or not keep_going:
+            break
+        time.sleep(1.0)
+
+
+def play(a, view, weights, label) -> bool:
+    """Play one map. Returns False if the user closed the window or pressed Ctrl+C."""
     from doom_env import make_env
 
     from actions import to_buttons
     from scorer import Tracker
 
     if a.map is None:
-        items = json.loads((ROOT / "maps_gen" / "heldout" / "index.json").read_text())
+        items = json.loads((ROOT / "maps_gen" / ("train" if a.live else "heldout") / "index.json").read_text())
         item = random.choice(items)
         wad, mapname, ticks = item["path"], "MAP01", item["ticks"]
     else:
@@ -210,7 +238,7 @@ def main():
         ticks = 4200
     TIER_NAMES = {"t1": "Tier 1: combat", "t2": "Tier 2: exploration", "t3": "Tier 3: keycard", "t4": "Tier 4: gauntlet"}
     stem = Path(wad).stem
-    level = f"{TIER_NAMES.get(stem[:2], 'Level')}  |  {stem if mapname == 'MAP01' else stem + ':' + mapname}"
+    level = f"{label}{TIER_NAMES.get(stem[:2], 'Level')}  |  {stem if mapname == 'MAP01' else stem + ':' + mapname}"
     print(f"map {wad}:{mapname}  ({level})")
     grid_path = Path(wad).with_suffix(".txt")
     if grid_path.exists():
@@ -221,7 +249,7 @@ def main():
         totals = {"keys": sum(g.count(c) for c in "rby"), "locks": sum(g.count(c) for c in "RBY"), "doors": g.count("D"),
                   "monsters": sum(g.count(c) for c in "zscid")}
     env = make_env(wad, mapname, episode_ticks=ticks, render_buffers=not a.no_map)
-    obs, _ = env.reset(seed=0)
+    obs, _ = env.reset(seed=random.randrange(10**6) if a.live else 0)
     tracker = Tracker(env.privileged_state())
     if a.policy == "teacher":
         from teacher import Teacher, door_open_fn
@@ -233,17 +261,19 @@ def main():
     else:
         from agent import DoomAgent
 
-        agent = DoomAgent(env.observation_space, env.action_space, "cpu", weights_path=a.weights)
+        agent = DoomAgent(env.observation_space, env.action_space, "cpu", weights_path=weights)
         agent.reset()
         step = agent.act
     from slam import Slam
 
-    view = None if a.no_map else MapView()
+    if view is not None:
+        view.reset()
     slam = Slam()  # display copy, built exactly like the agent's: from observations + its own actions
     slam.observe(obs)
     dt = 4 / 35 / a.speed
     k = 0
     act_ms = 0.0
+    stop = False
     try:
         while True:
             t0 = time.time()
@@ -272,17 +302,19 @@ def main():
                      f"      our score estimate: {res.score():.0f}", bad if res.dead or v[0] < 30 else white),
                 ]
                 if not view.draw(slam, lines, obs.get("rgb"), obs):
-                    view = None
+                    view, stop = None, True
+                    break
             if term or trunc:
                 break
             time.sleep(max(0.0, dt - (time.time() - t0)))
     except KeyboardInterrupt:
-        pass
+        stop = True
     if a.save_map and view is not None:
         view.pg.image.save(view.screen, a.save_map)
     res = tracker.result(Path(wad).name, 0).as_dict()
     print({k: res[k] for k in ("exit", "dead", "keys", "doors_opened", "locks_opened", "areas", "kills", "health", "score")})
     env.close()
+    return not stop
 
 
 if __name__ == "__main__":

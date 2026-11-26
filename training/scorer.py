@@ -32,6 +32,7 @@ class EpisodeResult:
     tic: int
     ticks: int
     crashed: bool = False
+    stuck: float = 0.0  # fraction of steps where the player moved less than 24 units over the last 20 steps
 
     def score(self) -> float:
         s = 0.0
@@ -58,6 +59,9 @@ class Tracker:
         self.door_lock = priv0["door_lock"]
         self.opened = np.zeros(len(self.door_lock), bool)
         self.areas: set = set()
+        self.pos: list = []
+        self.stuck_steps = 0
+        self.steps = 0
         self.update(priv0)
 
     def update(self, p: dict) -> None:
@@ -66,6 +70,12 @@ class Tracker:
             is_door = self.door_lock >= 0
             self.opened |= is_door & (p["sector_ceiling"] - p["sector_floor"] >= 56)
         self.last = p
+        self.pos.append((p["x"], p["y"]))
+        self.steps += 1
+        if len(self.pos) > 20:
+            x0, y0 = self.pos[-21]
+            if math.hypot(p["x"] - x0, p["y"] - y0) < 24.0:
+                self.stuck_steps += 1
 
     def result(self, map_name: str, tier: int, crashed: bool = False) -> EpisodeResult:
         p = self.last
@@ -74,7 +84,7 @@ class Tracker:
             keys=int(np.sum(p["keys"])), doors_opened=int(np.sum(self.opened & (self.door_lock == 0))),
             locks_opened=int(np.sum(self.opened & (self.door_lock > 0))), areas=len(self.areas),
             kills=int(p["kills"]), damage=float(p["damage_taken"]), health=float(p["health"]),
-            tic=int(p["tic"]), ticks=int(p["episode_ticks"]), crashed=crashed,
+            tic=int(p["tic"]), ticks=int(p["episode_ticks"]), crashed=crashed, stuck=self.stuck_steps / max(self.steps, 1),
         )
 
 
@@ -90,6 +100,7 @@ def summarize(results: list[EpisodeResult]) -> dict:
             "dead": float(np.mean([r.dead for r in rs])),
             "areas": float(np.mean([r.areas for r in rs])),
             "crashed": int(sum(r.crashed for r in rs)),
+            "stuck": float(np.mean([r.stuck for r in rs])),
         }
         out["weighted"] += TIER_WEIGHT[tier] * out[f"t{tier}"]["score"]
     return out
