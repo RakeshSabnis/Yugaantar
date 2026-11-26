@@ -13,6 +13,16 @@ the network to imitate a **training-only scripted teacher** with DAgger (the net
 labels every state it visits, so the network learns to recover from its own mistakes). The agent keeps its own **SLAM-style map** of the level, built only
 from its observations and its own actions, and reads it through a **learned planner module**.
 
+## Door colours from the frame
+
+The rays report "locked door" but not which key it needs, so an agent with one key wastes time at
+doors it cannot open. `submission/slam.py` reads each locked door's colour (red, blue or yellow
+grille) from the frame, using the depth buffer to pick the pixels that belong to that door. Until
+the agent holds the matching key, that door is shown to the network as a wall, in both its rays and
+its map; it turns back into a locked door when the key is picked up. This is observation
+preprocessing only. On 192 held-out levels with the same weights it raised the local score from
+1073 to 1108 (tier 3 exits 42% -> 50%, tier 4 12% -> 15%; tiers without locks unchanged).
+
 ## Repository layout
 
 ```

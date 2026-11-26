@@ -42,12 +42,12 @@ FULL_DIM = OBS_DIM + MAP_DIM + WIDE_DIM  # network input: encoded observation, f
 VITAL_SCALE = np.array([100, 100, 7, 50, 100, 50, 25, 100, 1, 1, 1, 1, 1, 1, 10, 10, 10], np.float32)
 
 
-def encode_obs(obs: dict) -> np.ndarray:
+def encode_obs(obs: dict, hit_types=None) -> np.ndarray:
     """Observation dict -> flat float32 vector of length OBS_DIM. NaN/inf-safe."""
     out = np.zeros(OBS_DIM, np.float32)
     rays = obs["rays"]
     dist = np.asarray(rays["distance"], np.float32).reshape(NUM_RAYS)
-    hit = np.clip(np.asarray(rays["hit_type"], np.int64).reshape(NUM_RAYS), 0, RAY_TYPES - 1)
+    hit = np.clip(np.asarray(rays["hit_type"] if hit_types is None else hit_types, np.int64).reshape(NUM_RAYS), 0, RAY_TYPES - 1)
     out[:NUM_RAYS] = dist
     onehot = np.zeros((RAY_TYPES, NUM_RAYS), np.float32)
     onehot[hit, np.arange(NUM_RAYS)] = 1.0
@@ -96,13 +96,15 @@ class Perception:
 
     def see(self, obs: dict) -> np.ndarray:
         x = np.zeros(FULL_DIM, np.float32)
-        x[:OBS_DIM] = encode_obs(obs)
+        hit_types = None
         try:
             self.slam.observe(obs)
+            hit_types = self.slam.ray_types(obs)  # locked doors we cannot open yet read as walls
             x[OBS_DIM:OBS_DIM + MAP_DIM] = self.slam.crop_packed().reshape(-1)
             x[OBS_DIM + MAP_DIM:] = self.slam.wide_packed().reshape(-1)
         except Exception:  # a mapping failure must never stop the agent: the map input stays empty
             pass
+        x[:OBS_DIM] = encode_obs(obs, hit_types)
         return x
 
     def did(self, buttons) -> None:
