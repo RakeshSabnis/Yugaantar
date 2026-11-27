@@ -8,6 +8,7 @@ edge-triggered, so pressing them twice in a row is masked out). Sampling uses on
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -19,10 +20,15 @@ sys.path.insert(0, str(SUBMISSION_DIR))
 
 import torch  # noqa: E402
 
-from actions import NEXTW_ACTIONS, NUM_ACTIONS, USE_ACTIONS, to_buttons  # noqa: E402
+from actions import COMBOS, NEXTW_ACTIONS, NUM_ACTIONS, USE_ACTIONS, to_buttons  # noqa: E402
 from model import Perception, Policy, load_compatible  # noqa: E402
 
 TEMPERATURE = float(__import__("os").environ.get("DOOM_TEMPERATURE", "0.5"))  # low-temperature sampling: mostly the best action, enough noise to escape loops
+
+
+FORWARD_ACTIONS = tuple(i for i, c in enumerate(COMBOS) if 0 in c)
+UNSTICK = __import__("os").environ.get("DOOM_UNSTICK", "1") == "1"
+STUCK_STEPS, MASK_STEPS = 6, 5
 
 
 class DoomAgent:
@@ -33,27 +39,14 @@ class DoomAgent:
         self.action_space = action_space
         torch.set_num_threads(1)
         self.device = torch.device("cpu")
-        # One or more trained networks. With several, their action probabilities are averaged (an ensemble):
-        # every decision still comes from trained parameters, and averaging makes play more consistent.
-        if weights_path:
-            paths = [Path(p) for p in str(weights_path).split(",")]
-        else:
-            paths = sorted(WEIGHTS_DIR.glob("policy*.pt"))
-        self.models = []
+        self.model = Policy()
+        path = Path(weights_path) if weights_path else WEIGHTS_DIR / "policy.pt"
         self.loaded = False
-        for path in paths:
-            if path.is_file():
-                m = Policy()
-                state = torch.load(path, map_location="cpu", weights_only=True)
-                load_compatible(m, state["model"] if "model" in state else state)
-                m.eval()
-                self.models.append(m)
-                self.loaded = True
-        if not self.models:
-            m = Policy()
-            m.eval()
-            self.models.append(m)
-        self.model = self.models[0]
+        if path.is_file():
+            state = torch.load(path, map_location="cpu", weights_only=True)
+            load_compatible(self.model, state["model"] if "model" in state else state)
+            self.loaded = True
+        self.model.eval()
         self.rng = np.random.default_rng(0)
         self.perception = Perception()
         self.reset()
@@ -69,25 +62,37 @@ class DoomAgent:
 
     def reset(self) -> None:
         """Called before every map: clear the recurrent memory and the action history."""
-        self.hs = [m.initial_state(1) for m in self.models]
+        self.h = self.model.initial_state(1)
         self.prev_action = 0
         self.rng = np.random.default_rng(0)
         self.perception.reset()
+        self.stuck = 0
+        self.no_forward = 0
 
     def act(self, observation: dict) -> np.ndarray:
         try:
             x = torch.from_numpy(self.perception.see(observation)).unsqueeze(0)
-            pa = torch.tensor([self.prev_action])
-            probs = None
-            for k, m in enumerate(self.models):
-                lg, _, self.hs[k] = m.step(x, pa, self.hs[k])
-                p_k = torch.softmax(lg[0].double(), -1).numpy()
-                probs = p_k if probs is None else probs + p_k
-            logits = np.log(np.maximum(probs / len(self.models), 1e-12))  # log of the averaged probabilities
+            logits, _, self.h = self.model.step(x, torch.tensor([self.prev_action]), self.h)
+            logits = logits[0].double().numpy()
             if self.prev_action in USE_ACTIONS:
                 logits[list(USE_ACTIONS)] = -np.inf
             if self.prev_action in NEXTW_ACTIONS:
                 logits[list(NEXTW_ACTIONS)] = -np.inf
+            if UNSTICK:
+                # Action masking from observation fields: if we have been pressing forward without
+                # moving (and are not just waiting at a door), forward is withheld for a few steps,
+                # so the network's own next-best choice (side-step, turn, back) gets us free.
+                v = np.nan_to_num(np.asarray(observation["vitals"], np.float64).reshape(-1))
+                rd = np.asarray(observation["rays"]["distance"], np.float64).reshape(-1) * 1024.0
+                rt = np.asarray(observation["rays"]["hit_type"]).reshape(-1)
+                at_door = any(rt[k] in (2, 3) and rd[k] < 96.0 for k in (0, 1, 63))
+                jammed = self.prev_action in FORWARD_ACTIONS and math.hypot(v[14], v[15]) < 0.5 and not at_door
+                self.stuck = self.stuck + 1 if jammed else 0
+                if self.stuck >= STUCK_STEPS:
+                    self.no_forward, self.stuck = MASK_STEPS, 0
+                if self.no_forward > 0:
+                    self.no_forward -= 1
+                    logits[list(FORWARD_ACTIONS)] = -np.inf
             if not np.all(np.isfinite(logits[np.isfinite(logits)])) or not np.isfinite(logits).any():
                 raise ValueError("bad logits")
             z = (logits - logits[np.isfinite(logits)].max()) / TEMPERATURE
@@ -100,6 +105,6 @@ class DoomAgent:
             return buttons
         except Exception:  # never crash: a crash freezes the player for the rest of the map
             self.prev_action = 1
-            self.hs = [m.initial_state(1) for m in self.models]
+            self.h = self.model.initial_state(1)
             self.perception.did(to_buttons(1))
             return to_buttons(1)  # move forward

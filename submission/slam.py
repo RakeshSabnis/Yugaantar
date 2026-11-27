@@ -33,6 +33,11 @@ WIDE_CELL = 256.0     # ...each 256 map units (4 x 4 fine cells), spanning 4096 
 F_IDX, B_IDX, SL_IDX, SR_IDX, TL_IDX, TR_IDX = 0, 1, 2, 3, 4, 5
 USE_IDX = 7
 _RAY_ANG = np.arange(NUM_RAYS) * (2 * math.pi / NUM_RAYS)
+DEPTH_UNITS = 7.6     # map units per depth-buffer level (measured)
+EXIT_CUE = __import__("os").environ.get("DOOM_EXIT", "1") == "1"  # paint seen exit pads into the map as frontier
+_PIX_ROWS = np.arange(62, 120, dtype=np.float64)[:, None]
+_PIX_LEFT = ((79.5 - np.arange(160)) / 80.0)[None, :]
+_FOV_RAYS = tuple(range(0, 8)) + tuple(range(57, 64))  # rays inside the 90 degree field of view
 _SAMPLES = np.linspace(0.0, 1.0, 40, endpoint=False)[1:]  # fractions along each ray for free-space painting
 
 
@@ -44,6 +49,10 @@ class Slam:
         self.free = np.zeros((SIZE, SIZE), np.uint8)
         self.hit = np.zeros((SIZE, SIZE), np.uint8)   # 0 none, 1 wall, 2 door, 3 locked door
         self.visit = np.zeros((SIZE, SIZE), np.uint8)
+        self.color = np.zeros((SIZE, SIZE), np.uint8)  # locked-door colour: 0 unknown, 1 red, 2 blue, 3 yellow
+        self.keys = np.zeros(4, bool)                  # keys held, by the same colour index
+        self.exit = np.zeros((SIZE, SIZE), np.uint8)   # cells where an exit pad has been seen
+        self.exit_false = 0
         self.tried = np.zeros((SIZE, SIZE), np.uint8)  # locked doors we pressed USE on that stayed shut
         self.pending: list = []   # (cell x, cell y, step at which to check whether the door opened)
         self.used_last = False    # did our last action press USE?
@@ -125,6 +134,8 @@ class Slam:
         self.x += 2.589 * vx + 1.801 * self.pvx
         self.y += 2.589 * vy + 1.801 * self.pvy
         self.pvx, self.pvy = vx, vy
+        k = np.nan_to_num(v[8:14]) > 0.5  # blue card, yellow card, red card, blue skull, yellow skull, red skull
+        self.keys[1], self.keys[2], self.keys[3] = bool(k[2] or k[5]), bool(k[0] or k[3]), bool(k[1] or k[4])
         self._paint(obs)
 
     def _cell(self, x, y):
@@ -158,6 +169,8 @@ class Slam:
             cx, cy = self._cell(hx, hy)
             ok = (cx >= 0) & (cx < SIZE) & (cy >= 0) & (cy < SIZE)
             self.hit[cy[ok], cx[ok]] = ht[solid][ok].astype(np.uint8)
+        self._door_colours(obs, d, ht, dx, dy)
+        self._exit_pads(obs)
         # an open door the ray now passes through: clear stale door marks along free space
         # Memory of failed attempts: we pressed USE facing a locked door; if it is still marked locked a
         # little later (a door that accepts our key is open by then), remember it as "tried".
@@ -183,6 +196,107 @@ class Slam:
         if 0 <= px < SIZE and 0 <= py < SIZE:
             self.visit[max(0, py - 1):py + 2, max(0, px - 1):px + 2] = 1
 
+    # ------------------------------------------------------------------ door colours (from the frame)
+    def _door_colours(self, obs: dict, d: np.ndarray, ht: np.ndarray, dx: np.ndarray, dy: np.ndarray) -> None:
+        """Rays report "locked door" but not which key it needs. The frame does: locked doors are drawn
+        with a red, blue or yellow grille. For every locked-door ray inside the field of view we look
+        at the matching image column, keep the pixels whose depth agrees with the ray, and store the
+        colour in the map. Without a frame (training with buffers off) nothing is stored."""
+        rgb, depth = obs.get("rgb"), obs.get("depth")
+        if rgb is None or depth is None:
+            return
+        rgb, depth = np.asarray(rgb), np.asarray(depth)
+        if rgb.shape != (120, 160, 3) or depth.shape != (120, 160) or not rgb.any():
+            return
+        top = rgb[20:58].astype(np.int16)
+        r, g, b = top[..., 0], top[..., 1], top[..., 2]
+        red = (r > 80) & (g < 40) & (b < 40)
+        if red.mean() > 0.30:
+            return  # taking damage tints the whole frame red: do not read colours from it
+        masks = (red, (b > 90) & (r < 40) & (g < 40), (r > 120) & (g > 70) & (b < 70) & (r > g + 25))
+        dep = depth[20:58].astype(np.float64) * DEPTH_UNITS
+        for k in _FOV_RAYS:
+            if ht[k] != 3 or d[k] >= RAY_RANGE - 1:
+                continue
+            th = _RAY_ANG[k] if k < NUM_RAYS // 2 else _RAY_ANG[k] - 2 * math.pi
+            col = int(round(79.5 - 80.0 * math.tan(th)))
+            if not 2 <= col <= 157:
+                continue
+            fwd = d[k] * math.cos(th)
+            sl = slice(col - 2, col + 3)
+            on = np.abs(dep[:, sl] - fwd) < 0.25 * fwd + 16.0  # pixels that are on this door, not in front of it
+            counts = [int((m[:, sl] & on).sum()) for m in masks]
+            best = int(np.argmax(counts))
+            if counts[best] < 6 or counts[best] < 2 * sorted(counts)[-2]:
+                continue
+            cx, cy = self._cell(self.x + dx[k] * (d[k] + 4.0), self.y + dy[k] * (d[k] + 4.0))
+            if 0 <= cx < SIZE and 0 <= cy < SIZE:
+                self.color[cy, cx] = best + 1
+
+    # ------------------------------------------------------------------ exit pads (from the frame)
+    def _exit_pads(self, obs: dict) -> None:
+        """Neither the rays nor the entity list show the exit. The frame does: the exit pad is a
+        saturated red floor. Each such pixel is placed with the depth buffer and remembered; the map
+        then presents those cells to the network as frontier, i.e. as somewhere worth walking to.
+        Upright red things (blood, corpses, fireballs) are rejected because all their pixels share one
+        depth, while a pad lying on the floor spans a range of depths along an image column."""
+        px, py = self._cell(self.x, self.y)
+        if 0 <= px < SIZE and 0 <= py < SIZE:
+            if self.exit[py, px]:
+                self.exit_false += 1  # stood on a "pad" and the level did not end: the cue is wrong here
+                if self.exit_false >= 3:
+                    self.exit[:] = 0
+            self.exit[py, px] = 0
+        if not EXIT_CUE or self.exit_false >= 3:
+            return
+        rgb, depth = obs.get("rgb"), obs.get("depth")
+        if rgb is None or depth is None:
+            return
+        rgb, depth = np.asarray(rgb), np.asarray(depth)
+        if rgb.shape != (120, 160, 3) or depth.shape != (120, 160) or not rgb.any():
+            return
+        lo = rgb[62:]
+        r = lo[..., 0].astype(np.int16)
+        red = (r > 80) & (lo[..., 1] < r * 0.35) & (lo[..., 2] < r * 0.35)
+        if not red.any():
+            return
+        top = rgb[:40]
+        tr = top[..., 0].astype(np.int16)
+        if ((tr > 80) & (top[..., 1] < tr * 0.35) & (top[..., 2] < tr * 0.35)).mean() > 0.10 or red.mean() > 0.35:
+            return  # damage tint
+        fwd = depth[62:].astype(np.float64) * DEPTH_UNITS
+        red &= np.abs(fwd * (_PIX_ROWS - 60.0) - 3800.0) < 600.0  # on the floor plane
+        span = np.where(red, fwd, -np.inf).max(0) - np.where(red, fwd, np.inf).min(0)
+        red &= ((red.sum(0) >= 2) & (span >= 20.0))[None, :]      # lies flat: spans real ground
+        if red.sum() < 3:
+            return
+        f = fwd[red]
+        lf = (fwd * _PIX_LEFT)[red]
+        c, s = math.cos(self.heading), math.sin(self.heading)
+        cx, cy = self._cell(self.x + f * c - lf * s, self.y + f * s + lf * c)
+        ok = (cx >= 0) & (cx < SIZE) & (cy >= 0) & (cy < SIZE)
+        self.exit[cy[ok], cx[ok]] = 1
+
+    def effective_hit(self) -> np.ndarray:
+        """The hit grid as the network should see it: a locked door whose colour we have read and whose
+        key we do not hold is shown as a wall. It turns back into a locked door when the key is picked up."""
+        blocked = (self.hit == 3) & (self.color > 0) & ~self.keys[self.color]
+        return np.where(blocked, 1, self.hit).astype(np.uint8)
+
+    def ray_types(self, obs: dict) -> np.ndarray:
+        """Ray hit types with the same filter applied (see effective_hit)."""
+        d = np.clip(np.nan_to_num(np.asarray(obs["rays"]["distance"], np.float64).reshape(NUM_RAYS), nan=1.0), 0.0, 1.0) * RAY_RANGE
+        ht = np.asarray(obs["rays"]["hit_type"], np.int64).reshape(NUM_RAYS).copy()
+        sel = np.flatnonzero((ht == 3) & (d < RAY_RANGE - 1))
+        if len(sel):
+            ang = self.heading + _RAY_ANG[sel]
+            cx, cy = self._cell(self.x + np.cos(ang) * (d[sel] + 4.0), self.y + np.sin(ang) * (d[sel] + 4.0))
+            ok = (cx >= 0) & (cx < SIZE) & (cy >= 0) & (cy < SIZE)
+            col = np.zeros(len(sel), np.int64)
+            col[ok] = self.color[cy[ok], cx[ok]]
+            ht[sel[(col > 0) & ~self.keys[col]]] = 1
+        return ht
+
     # ------------------------------------------------------------------ network input
     def crop_packed(self) -> np.ndarray:
         """(CROP, CROP) uint8 ego-centric map, one bit per layer: 1 free, 2 wall, 4 door, 8 locked door,
@@ -191,18 +305,19 @@ class Slam:
         k = (np.arange(CROP) - CROP / 2 + 0.5) * CROP_CELL
         fwd = -k[:, None] * np.ones((1, CROP))
         left = -k[None, :] * np.ones((CROP, 1))
+        eff = self.effective_hit()
         c, s = math.cos(self.heading), math.sin(self.heading)
         cx, cy = self._cell(self.x + fwd * c - left * s, self.y + fwd * s + left * c)
         ok = (cx >= 0) & (cx < SIZE) & (cy >= 0) & (cy < SIZE)
         cx, cy = np.clip(cx, 0, SIZE - 1), np.clip(cy, 0, SIZE - 1)
-        hit = self.hit[cy, cx]
+        hit = eff[cy, cx]
         free = self.free[cy, cx]
         # frontier: seen floor that touches a never-seen cell = where unexplored space begins
-        known = (self.free > 0) | (self.hit > 0)
+        known = (self.free > 0) | (eff > 0)
         unknown_nb = np.zeros_like(free, dtype=bool)
         for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             unknown_nb |= ~known[np.clip(cy + dy, 0, SIZE - 1), np.clip(cx + dx, 0, SIZE - 1)]
-        frontier = (free > 0) & (hit == 0) & unknown_nb
+        frontier = ((free > 0) & (hit == 0) & unknown_nb) | ((self.exit[cy, cx] > 0) & (hit == 0))
         out = (free | ((hit == 1) << 1) | ((hit == 2) << 2) | ((hit == 3) << 3) | (self.visit[cy, cx] << 4) | (frontier.astype(np.uint8) << 5)
                | (int(self.keys_n > 0) << 6) | (self.tried[cy, cx].astype(np.int64) << 7))
         return (out * ok).astype(np.uint8)
@@ -215,17 +330,18 @@ class Slam:
         k = (np.arange(WIDE) - WIDE / 2 + 0.5) * WIDE_CELL
         fwd = (-k[:, None, None, None] + sub[None, None, :, None]) * np.ones((WIDE, WIDE, 4, 4))
         left = (-k[None, :, None, None] + sub[None, None, None, :]) * np.ones((WIDE, WIDE, 4, 4))
+        eff = self.effective_hit()
         c, s = math.cos(self.heading), math.sin(self.heading)
         cx, cy = self._cell(self.x + fwd * c - left * s, self.y + fwd * s + left * c)
         ok = (cx >= 0) & (cx < SIZE) & (cy >= 0) & (cy < SIZE)
         cx, cy = np.clip(cx, 0, SIZE - 1), np.clip(cy, 0, SIZE - 1)
         free = (self.free[cy, cx] > 0) & ok
-        hit = self.hit[cy, cx] * ok
-        known = (self.free > 0) | (self.hit > 0)
+        hit = eff[cy, cx] * ok
+        known = (self.free > 0) | (eff > 0)
         unknown_nb = np.zeros_like(free)
         for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             unknown_nb |= ~known[np.clip(cy + dy, 0, SIZE - 1), np.clip(cx + dx, 0, SIZE - 1)]
-        frontier = free & (hit == 0) & unknown_nb
+        frontier = (free & (hit == 0) & unknown_nb) | ((self.exit[cy, cx] > 0) & ok & (hit == 0))
         anyf = lambda a: a.any(axis=(2, 3)).astype(np.uint8)  # noqa: E731
         return (anyf(free) | (anyf((self.visit[cy, cx] > 0) & ok) << 1) | (anyf(frontier) << 2)
                 | (anyf(hit == 2) << 3) | (anyf(hit == 3) << 4) | (anyf(hit == 1) << 5)
@@ -236,6 +352,7 @@ class Slam:
         k = (np.arange(CROP) - CROP / 2 + 0.5) * CROP_CELL
         fwd = -k[:, None] * np.ones((1, CROP))          # rows: ahead (top) to behind (bottom)
         left = -k[None, :] * np.ones((CROP, 1))         # cols: left to right
+        eff = self.effective_hit()
         c, s = math.cos(self.heading), math.sin(self.heading)
         wx = self.x + fwd * c - left * s
         wy = self.y + fwd * s + left * c
@@ -244,7 +361,7 @@ class Slam:
         cx, cy = np.clip(cx, 0, SIZE - 1), np.clip(cy, 0, SIZE - 1)
         out = np.zeros((CHANNELS, CROP, CROP), np.float32)
         free = self.free[cy, cx] * ok
-        hit = self.hit[cy, cx] * ok
+        hit = eff[cy, cx] * ok
         out[0] = free
         out[1] = hit == 1
         out[2] = hit == 2
