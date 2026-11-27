@@ -194,6 +194,15 @@ at the start and did not come back to them for the one fact the rays do not carr
 
 **Conclusion: `main` is the team's submission.** `yash` is the record of how the network was trained.
 
+### 06:25–07:00 · Second seed set against `main`, sync, retraining with frames on
+
+| Tried | Result | Kept? |
+|---|---|---|
+| `main` vs `yash` on a second seed set of the 180 maps | 783 vs 812 (first seed set: 884 vs 762; `main`'s generator: 1,081 vs 971). Average over 440 games: 879 vs 821, `main` +7% | Corrects the earlier "+16%": the two are close; `main` is stuck half as often and better on keycard maps |
+| Copied `main`'s agent and training code into `yash` | Agent files identical to `main`'s; validator passes | Yes |
+| Per-tier agreement with the teacher on unseen maps (network plays) | Actions 57 / 62 / 61 / 70%, direction 63 / 62 / 58 / 71% (tiers 1–4); on training games it is about 82% | Measurement |
+| **Retraining with frames on** (the network had never been trained with the door-colour and exit inputs it runs with), 3 rounds | Seed set 1: 731, 888, 850 (current agent 825). Seed set 2: round 1 825, round 2 861 (current agent 866) | Round 2 kept on `yash` as a **tie** (average 856 vs 846), not a verified gain |
+
 ---
 
 ## What we are going ahead with

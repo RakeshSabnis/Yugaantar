@@ -33,7 +33,7 @@ def run_one(args) -> dict:
     from scorer import Tracker
     from submission.actions import to_buttons
 
-    env = make_env(item["path"], item.get("map", "MAP01"), episode_ticks=item["ticks"], render_buffers=False)
+    env = make_env(item["path"], item.get("map", "MAP01"), episode_ticks=item["ticks"], render_buffers=os.environ.get("DOOM_FRAMES", "0") == "1")  # frames on: door colours and exit pads are read from the image
     obs, _ = env.reset(seed=seed)
     tracker = Tracker(env.privileged_state())
     grid = Path(item["path"]).with_suffix(".txt").read_text() if Path(item["path"]).with_suffix(".txt").exists() else None
