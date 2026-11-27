@@ -35,6 +35,7 @@ USE_IDX = 7
 _RAY_ANG = np.arange(NUM_RAYS) * (2 * math.pi / NUM_RAYS)
 DEPTH_UNITS = 7.6     # map units per depth-buffer level (measured)
 EXIT_CUE = __import__("os").environ.get("DOOM_EXIT", "1") == "1"  # paint seen exit pads into the map as frontier
+EXIT_PATIENCE = 20    # steps inside a marked cell before the mark is dropped
 _PIX_ROWS = np.arange(62, 120, dtype=np.float64)[:, None]
 _PIX_LEFT = ((79.5 - np.arange(160)) / 80.0)[None, :]
 _FOV_RAYS = tuple(range(0, 8)) + tuple(range(57, 64))  # rays inside the 90 degree field of view
@@ -53,6 +54,7 @@ class Slam:
         self.keys = np.zeros(4, bool)                  # keys held, by the same colour index
         self.exit = np.zeros((SIZE, SIZE), np.uint8)   # cells where an exit pad has been seen
         self.exit_false = 0
+        self.on_exit = 0
         self.tried = np.zeros((SIZE, SIZE), np.uint8)  # locked doors we pressed USE on that stayed shut
         self.pending: list = []   # (cell x, cell y, step at which to check whether the door opened)
         self.used_last = False    # did our last action press USE?
@@ -242,11 +244,19 @@ class Slam:
         depth, while a pad lying on the floor spans a range of depths along an image column."""
         px, py = self._cell(self.x, self.y)
         if 0 <= px < SIZE and 0 <= py < SIZE:
+            # A map cell is as wide as the pad, so being in a marked cell is not yet being on the pad:
+            # keep the mark while the agent closes in. Only after it has stayed in the cell for a while
+            # without the level ending do we conclude the cue was wrong there.
             if self.exit[py, px]:
-                self.exit_false += 1  # stood on a "pad" and the level did not end: the cue is wrong here
-                if self.exit_false >= 3:
-                    self.exit[:] = 0
-            self.exit[py, px] = 0
+                self.on_exit += 1
+                if self.on_exit >= EXIT_PATIENCE:
+                    self.exit[py, px] = 0
+                    self.on_exit = 0
+                    self.exit_false += 1
+                    if self.exit_false >= 3:
+                        self.exit[:] = 0
+            else:
+                self.on_exit = 0
         if not EXIT_CUE or self.exit_false >= 3:
             return
         rgb, depth = obs.get("rgb"), obs.get("depth")
